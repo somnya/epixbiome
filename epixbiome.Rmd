@@ -1,0 +1,3258 @@
+---
+title: "epixbiome"
+author: "Eddy Mendoza"
+date: "2024-01-30"
+output: html_document
+---
+
+################################################################
+#  Exploring the quantitative genetics of the root microbiome  
+  Thesis project for the LMU EES and the MEME program         
+  Eddy Mendoza-Galindo                                        
+  Claude Becker                                                
+################################################################
+
+
+```{r setup, include=FALSE}
+# analysis
+source("custom_functions.R") 
+library(readxl)
+library(tidyverse)
+library(data.table)
+library(reshape2)
+library(EnvStats) # beta distributions
+library(stringr)
+library(lme4) # LMMS
+library(reshape2)
+library(betareg) # beta regression
+library(gtools) # foldchange calculation
+library(ape) # tree handling and analysis
+library(phytools) # tree analysis
+library(fitdistrplus) # find distributions
+library(bestNormalize) # find the best transformation
+library(performance) # evaluate residuals of mixed models 
+library(car) # evaluate mixed models
+library(broom) # evaluate lm models
+library(emmeans) # LSmean and LSse calculation
+library(DESeq2)
+library(igraph)
+# microbiome analysis
+meta_cols = c("ID", "sample", "position", "block", "harv_date", "harv_pers") # store the names of the metadata columns
+formula = "~ (1|sample) + (1|run) + (1|block) + (1|position) + (1|harv_date) + (1|harv_pers)"
+formula_AS = "~ sample + run + (1|block) + (1|position) + (1|harv_date) + (1|harv_pers)"
+library(dada2)
+library(phyloseq)
+library(taxa)
+library(phangorn)
+library(DECIPHER)
+library(vegan)
+getN = function(x) as.numeric(sum(getUniques(x)))
+# multicore jobs
+library(future)
+library(future.apply)
+library(RhpcBLASctl)
+setDTthreads(threads = 16)
+blas_set_num_threads(16)
+# graphics
+library(MetBrewer)
+library(circlize)
+library(aplot) # combine plots
+library(ggtree)
+library(UpSetR)
+library(ggraph)
+library(gggenes)
+# palettes
+palette_H = rev(met.brewer("Hokusai1")[5:7]) # for variance components, 
+met.brewer("Cross") # for epigenotypes
+c(met.brewer("Egypt") ) # for methylation contexts
+# for Phylums, viridis normal discrete
+# for selection, viridis magma
+```
+
+# 1 .- The genetics and epigenetics of the epiRIL population
+
+
+```{r general stats methylation all lines}
+# percentage of methylation in each context and chr
+biscuit_stats = read.table("data/biscuit_all.vcf_meth_average.tsv", header = T)
+
+# clean data
+biscuit_stats = biscuit_stats[biscuit_stats$chrm != "WholeGenome", c(1,2,4,6,8)]
+
+# transform
+biscuit_stats = melt(biscuit_stats, id.vars = c("sample", "chrm"), variable.name = "context", value.name = "perc")
+
+biscuit_stats = rbind(
+filter(biscuit_stats, chrm %in% c("C", "M")) %>% mutate(compartment = "organelle"),
+filter(biscuit_stats, !chrm %in% c("C", "M")) %>% mutate(compartment = "nuclear")
+)
+
+biscuit_stats$perc = as.numeric(gsub("%", "", biscuit_stats$perc))
+biscuit_stats$context = gsub("b", "", biscuit_stats$context)
+
+# plot
+ggplot(biscuit_stats) +
+  geom_density(aes(perc, color=chrm), size=1) +
+  facet_grid(compartment ~ context, scales = "free_y") +
+  scale_color_manual(values = c(met.brewer("Cross")[1:5], met.brewer("Cross")[6:7])) +
+  labs(x="Percentage of methylated cytosines", y="Density", color="Chromosome") +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 20),
+        panel.border = element_rect(color = "black", fill=NA),
+        panel.spacing = unit(1, "lines")) 
+
+ggsave("figures/percentage_mC_per_chr.png", width = 8, height = 6, dpi = 600)
+
+
+# spectrum of methylation frequency
+matrix_random_sample = read.table("data/random_sample_header.tsv", header = T)
+# delete mitochondria data since many calls are biased towards orthologs
+matrix_random_sample = filter(matrix_random_sample, !chr == "M")
+
+# transform
+matrix_random_sample = rbind(
+filter(matrix_random_sample, chr == "C") %>% mutate(compartment = "chloroplast") %>% relocate(compartment),
+filter(matrix_random_sample, !chr == "C") %>% mutate(compartment = "nuclear") %>% relocate(compartment)
+)
+
+matrix_random_sample = matrix_random_sample %>% mutate(id = paste(chr, paste(pos, strand, sep = "_"), sep = "_")) %>% dplyr::select(-c(strand, chr, pos)) %>% relocate(id)
+
+matrix_random_sample = melt(matrix_random_sample, id.vars = c("id", "class", "compartment"), variable.name = "sample", value.name = "perc")
+
+# plot
+ggplot(filter(matrix_random_sample, perc>0, compartment=="nuclear")) +
+  geom_density(aes(perc, group=sample, color=class), alpha=0.6, size=0.5, bw=4) +
+  facet_grid(~class, scales = "free") +
+  scale_color_manual(values = met.brewer("Egypt", 3)) +
+  labs(x="Methylation (%)", y="Density", color="Context") +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 20),
+        panel.border = element_rect(color = "black", fill=NA),
+        panel.spacing = unit(1, "lines")) 
+
+ggsave("figures/percentage_mC_per_cytosine.png", width = 12, height = 5, dpi = 600)
+
+ggplot(filter(matrix_random_sample, perc>0 & perc<30, compartment=="nuclear")) +
+  geom_density(aes(perc, color=class, fill=class), alpha=0.2, size=0.5, bw=0.6) +
+  geom_vline(xintercept = 15.5, linetype = "dashed", size=1) +
+  scale_color_manual(values = met.brewer("Egypt", 3)) +
+  labs(x="Methylation (%)", y="Density", color="Context", fill="Context") +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 20),
+        panel.border = element_rect(color = "black", fill=NA),
+        panel.spacing = unit(1, "lines")) 
+
+ggsave("figures/threshold_methylation.png", width = 8, height = 4, dpi = 600)
+
+rm(biscuit_stats, matrix_random_sample)
+```
+
+
+```{r snp pre-analysis}
+subs_snp = rbind(
+as.data.frame(table(read.table("data/filtered.bed", header = F)$V4)) %>% mutate(set = "filtered"),
+as.data.frame(table(read.table("data/biallelic.bed", header = F)$V4)) %>% mutate(set = "all")
+)
+
+# calculate percentages
+subs_snp = subs_snp %>% group_by(set) %>% mutate(perc = Freq*100/sum(Freq))
+
+# plot
+ggplot(subs_snp) +
+  geom_bar(aes(Var1, perc, fill=set), stat = "identity", color="gray4", size=0.5, position = "dodge2") +
+  labs(x="Substitution type", y="Percentage", fill="SNP dataset") +
+  scale_fill_manual(values = c("gray", "gray40")) +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 20),
+        panel.border = element_rect(color = "black", fill=NA),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 15)
+        ) 
+
+ggsave("figures/substitution_snps.png", width = 8, height = 5, dpi = 600)
+
+# check missing data and frequencies
+counts_snps = read.table("data/snps/maf_per_site.frq.counts", header = T)
+
+# histogram of missing data
+ggplot(counts_snps) +
+  geom_density(aes(G0*100/169))
+
+# get SNPs with <20% missing individual genotypes
+filter(counts_snps, G0<34) %>% group_by(SNP) %>%
+  mutate(freq_r = C1/(C1+C2), freq_a = C2/(C1+C2), maf = min(c(freq_r, freq_a)), missing_data = G0/169) %>%
+  dplyr::select(SNP, maf, missing_data) %>%
+  melt(id.vars = "SNP") %>%
+  ggplot() +
+  geom_density(aes(value, fill=variable), bw = 0.02, alpha=0.4) +
+  labs(x="Value", y="Density", fill="Variable") +
+  scale_fill_manual(values = met.brewer("Derain")) +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 20),
+        panel.border = element_rect(color = "black", fill=NA),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 15)
+        ) 
+
+ggsave("figures/snps_maf_md.png", width = 5, height = 5, dpi = 600)
+
+# check the substitution rate of WT SNPs (filtered only)
+as.data.frame(table(read.table("data/wt_snps.bed")$V4) ) %>% 
+  mutate(perc = Freq*100/sum(Freq)) %>% 
+  ggplot() +
+  geom_bar(aes(Var1, perc), stat = "identity", color="gray4", size=0.5, position = "dodge2") +
+  labs(x="Substitution type", y="Percentage") +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 20),
+        panel.border = element_rect(color = "black", fill=NA),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 15)
+        ) 
+
+ggsave("figures/substitution_wt_snps.png", width = 6, height = 5, dpi = 600)
+
+
+# check the distribution of WT snps
+chr_sizes = read.table("data/chr_sizes.txt")
+colnames(chr_sizes) = c("chr", "end")
+chr_sizes = chr_sizes %>% mutate(start = "1") %>% relocate(start, .before = end)
+
+# read wt bed
+wt_snps_bed = read.table("data/wt_snps.bed")
+colnames(wt_snps_bed) = c("chr", "start", "end", "sub")
+# read my snps
+snps_bed = read.table("data/filtered.bed")
+colnames(snps_bed) = c("chr", "start", "end", "sub")
+# read gene distribution
+genes_bed = read.table("data/genes.bed")[,1:4]
+colnames(genes_bed) = c("chr", "start", "end", "nn")
+
+# remove organelles
+chr_sizes = filter(chr_sizes, !chr %in% c("M", "C"))
+wt_snps_bed = filter(wt_snps_bed, !chr %in% c("M", "C"))
+snps_bed = filter(snps_bed, !chr %in% c("M", "C"))
+genes_bed = filter(genes_bed, !chr %in% c("M", "C"))
+
+# plot circos
+{
+png(file="figures/snp_density.png", width=2000, height=2000)
+circos.par("clock.wise"=TRUE, start.degree=86, gap.degree=8)
+circos.genomicInitialize(chr_sizes, plotType = c("axis"), axis.labels.cex=2)
+#circos.track(ylim = c(0, 0.05), bg.border = NA, bg.col = met.brewer("Cross", 5), track.height = 0.05)
+circos.genomicDensity(genes_bed, col = c("gray40"), track.height = 0.1, count_by = "number")
+circos.genomicDensity(wt_snps_bed, col = c("#5EBF75"), track.height = 0.2, count_by = "number")
+circos.genomicDensity(snps_bed, col = c("#1E9CC8"), track.height = 0.2, count_by = "number")
+circos.clear()
+dev.off()
+}
+```
+
+
+```{r snp-based population analysis}
+# read eigenvalues
+read.table("data/snps/pca_all.eigenval", header = F) %>% mutate(perc = V1*100/sum(V1))
+# 8.085454 and 7.209628
+read.table("data/snps/pca_no-ld.eigenval", header = F) %>% mutate(perc = V1*100/sum(V1))
+# 8.192698	and 6.858686
+
+# eigenvectors, combine both
+eigenvec = rbind(
+read.table("data/snps/pca_all.eigenvec", header = F)[, c(1,3,4)] %>% mutate(set = "All SNPs"),
+read.table("data/snps/pca_no-ld.eigenvec", header = F)[, c(1,3,4)] %>% mutate(set = "LD-filtered SNPs")
+)
+colnames(eigenvec) = c("sample", "PC1", "PC2", "set")
+
+# identify lines that were used to analyze microbiome
+list_biome = data.frame(sample = paste("eR", read.table("data/list_epiRILs_microbiome.txt", header = F)$V1, sep = "")) %>% mutate(biome = "yes")
+eigenvec = eigenvec %>% left_join(list_biome, by="sample") %>% mutate(biome = replace_na(biome, "no"))
+
+# add heterozygosity
+het = read.table("data/snps/individual.het", header = F)[-1,] %>% 
+  mutate(het = as.numeric(V2)/as.numeric(V4)) %>%
+  dplyr::select(V1, het) %>% 
+  rename("sample" = "V1")
+eigenvec = eigenvec %>% left_join(het, by="sample")
+
+# set order
+eigenvec$biome = factor(eigenvec$biome, levels = c("yes", "no"))
+
+# plot
+ggplot(eigenvec) +
+  geom_point(aes(PC1, PC2, fill=biome, size=het), shape=21, color="gray4") +
+  facet_wrap(~set) +
+  scale_fill_manual(values = met.brewer("Egypt")) +
+  labs(x="PC1", y="PC2", fill="Microbiome", size="Heterozygosity") +
+  theme_bw() +
+  theme(text = element_text(size = 20),
+        panel.border = element_rect(color = "black", fill=NA)
+        )
+
+ggsave("figures/genetic_pca.png", width = 10, height = 5, dpi = 600)
+```
+
+
+```{r DMRs root vs Leaf}
+# load matrix from Rille
+root_leaf = read.table("data/root_leaf_matrix.tsv", header = T)
+# Not all DMRs are present, I guess it's due to coverage reasons
+
+# Run a PCA with the built-in function (Only 5 components)
+pca_tissues = prcomp(root_leaf[, -c(1:5)], rank. = 20)
+pca_tissues = as.data.frame(pca_tissues[["rotation"]]) %>% 
+  mutate(sample = row.names(pca_tissues[["rotation"]]) )
+
+pca_tissues = pca_tissues %>% mutate(tissue = str_extract(pca_tissues$sample, "root|leaf"),
+                                     PC1 = round(abs(PC1), digits = 2),
+                                     PC2 = round(abs(PC2), digits = 2))
+# I made the PCs positive and rounded so the models don't complain
+
+# Plot
+ggplot(pca_tissues) +
+  geom_point(aes(PC1, PC2, fill=tissue), shape=21, size=5) 
+
+# transform matrix
+root_leaf = root_leaf %>% 
+  dplyr::select(-c(chr_dmr, start_dmr, end_dmr, context)) %>%
+  melt(id.vars="id_dmr", value.name = "mean_mC", variable.name = "sample") %>%
+  mutate(mean_mC = round(mean_mC/100, digits = 3)) %>%
+  left_join(pca_tissues[,c("sample", "tissue")], by="sample")
+
+# beta regression doesn't likes 1s or 0s so those values need to be transformed
+# Transformation formula: { (Y * (n−1) + 0.5) / n }
+# References: https://doi.org/10.1037/1082-989X.11.1.54 and the official package https://cran.r-project.org/web/packages/betareg/vignettes/betareg.pdf (find "if y also assumes the extremes 0 and 1")
+root_leaf = root_leaf %>% group_by(id_dmr, tissue) %>% mutate(mean_mC_t = (mean_mC*(n()-1)+0.5)/n()) 
+# now the extremes are 0.16 and 0.83
+
+# Perform Differential Analysis using a GLMM
+# I tried a GLMM using the PCs as random effects (since one root sample is in-between the tissues) but the low number of samples made the covariance matrix and the intercepts as 00
+# The Binomial GLM didn't work either since all p-values were inflated towards no statistical difference since probably the y variable was not well suited. I also discarded it
+# p.binomial = as.numeric(summary(glm(mean_mC ~ tissue, family = binomial(link = "logit"), data = test))$coefficients[,4][2])
+
+# Get the DMR ids to iterate 
+dmr_list = as.list(unique(root_leaf$id_dmr))
+
+# create an empty list to store the results
+differential_methylation = list()
+
+# fisher p function
+fisher_p = function(fem, mal) { 
+  fem=round(fem*100, digits = 0)
+  mal=round(mal*100, digits = 0)
+fisher.test( data.frame(c(fem, mal), c(100-fem, 100-mal)) )$p.value
+}
+
+# iterate analysis
+for (i in seq_along(dmr_list)) {
+  
+  current_DMR = dmr_list[[i]]
+  #current_DMR = "dmr_19873_CG" # DMR with very obvious differences
+  #current_DMR = "dmr_85_CG" # roots have a value of 100%
+  # subset data
+  test = filter(root_leaf, id_dmr==current_DMR) 
+  
+  # Do analysis
+  if (sd(filter(test, tissue=="root")$mean_mC_t)== 0 && sd(filter(test, tissue=="root")$mean_mC_t)== 0) {
+      # if there is not variance then perform a Fisher exact test
+    p.val = fisher_p(mean(filter(test, tissue=="root")$mean_mC_t), mean(filter(test, tissue=="leaf")$mean_mC_t))
+    test = "fisher"
+  }
+  
+  else {
+  # Perform Beta Regression and store p.value
+    p.val = summary(betareg(mean_mC_t ~ tissue, data = test, link = "logit"))$coefficients$mean[,4][2]
+    test = "beta_regression"
+  }
+
+  # Save test results 
+  differential_methylation[[i]] = c(current_DMR, p.val, test)
+}
+# it takes around 10 min in the R server
+
+# paste results
+dm_results = as.data.frame(do.call(rbind, differential_methylation))
+colnames(dm_results) = c("id_dmr", "p.val", "test")
+
+# Correct pvalues
+dm_results = data.frame(dm_results, adj_p = p.adjust(dm_results$p.val, method = "fdr"))
+filter(dm_results, adj_p < 0.05) %>% ggplot() + geom_density(aes(adj_p, fill=test)) 
+# I don't perceive any p.inflation depending on the test
+
+# separate mC by tissue, calculate foldchange and add p.val
+# determine if a DM is differentially methylated using the filters:
+# Pval<0.001
+# There is at least 20% difference in methylation and they are not both 0's
+# FoldChange > 3, or, == Inf (when one of the values is 0)
+
+dm_all = cbind(
+root_leaf %>% filter(tissue == "root") %>% group_by(id_dmr) %>% summarise(mC = mean(mean_mC)) %>% rename("root_mC" = "mC") %>%
+  ungroup(),
+
+root_leaf %>% filter(tissue == "leaf") %>% group_by(id_dmr) %>% summarise(mC = mean(mean_mC)) %>% rename("leaf_mC" = "mC") %>%
+  ungroup()
+)[,-3] %>% left_join(dm_results[,c("id_dmr", "adj_p")], by="id_dmr") %>%
+  mutate(fold_change = abs(foldchange(root_mC, leaf_mC))) %>%
+  mutate(status = ifelse(adj_p < 0.001 & root_mC!=leaf_mC & abs(root_mC-leaf_mC)>0.2 & (fold_change > 3 | fold_change == Inf), "dm", "equal"))
+
+length(filter(dm_all, status=="dm")$id_dmr)
+
+# plot
+ggplot(dm_all) +
+  geom_point(aes(root_mC, leaf_mC, color=status)) +
+  scale_color_manual(values = c(met.brewer("Egypt")[3], "gray")) +
+  labs(x="Mean methylation in roots", y="Mean methylation in leaves", fill="Status") +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 20),
+        panel.border = element_rect(color = "black", fill=NA)
+        )
+
+ggsave("figures/root_vs_leaf.png", width = 6.6, height = 6, dpi = 600)
+
+# save file
+write.table(dm_all, file = "data/root_leaf_differential_mC.tsv", sep = "\t", col.names = T, row.names = F, quote = F)
+```
+
+
+```{r pca all vs experiment}
+# read data
+all_matrix = read.table("data/all_matrix.tsv", header = T)
+
+pca_all = prcomp(all_matrix[, -c(1:5)]) # It does one PC per sample
+pca_all[["sdev"]][1]*100 / sum(pca_all[["sdev"]]) # 9,10% PC1
+pca_all[["sdev"]][2]*100 / sum(pca_all[["sdev"]]) # 2,99% PC1
+
+pca_all = as.data.frame(pca_all[["rotation"]][,1:2]) %>% 
+  mutate(sample = row.names(pca_all[["rotation"]])) %>%
+  relocate(sample)
+
+# make a list of epiRILs that were in the experiment
+list_biome = data.frame(sample = paste("eR", read.table("data/list_epiRILs_microbiome.txt", header = F)$V1, sep = "")) %>% mutate(biome = "yes")
+
+# merge info
+pca_all = pca_all %>% left_join(list_biome, by="sample") %>% mutate(biome = replace_na(biome, "no"))
+
+# plot
+ggplot(pca_all) +
+  geom_point(aes(PC1, PC2, fill=biome), color="gray4", size=4, shape=21) +
+  scale_fill_manual(values = met.brewer("Egypt")) +
+  labs(x="PC1 (9.10%)", y="PC2 (2.99%)", fill="Microbiome") +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 20),
+        panel.border = element_rect(color = "black", fill=NA),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 10),
+        axis.text.y = element_text(angle = 45, vjust = 1, hjust=1, size = 10)
+        )
+
+ggsave("figures/pca_all.png", width = 5, height = 5.5, dpi = 600)
+```
+
+
+```{r compare trees}
+# if needed, read data again
+all_matrix = read.table("data/all_matrix.tsv", header = T)
+list_biome = data.frame(sample = paste("eR", read.table("data/list_epiRILs_microbiome.txt", header = F)$V1, sep = "")) %>% mutate(biome = "yes")
+
+# make a distance tree
+upgma_eu = hclust(dist(t(all_matrix[,-c(1:5)]) ))
+upgma_eu = as.phylo(upgma_eu)
+
+# read binary tree
+epi_tree = read.tree("data/epi-genetic.tree")
+
+# Make Co-Phylo
+eR_cophylo = cophylo(upgma_eu, epi_tree)
+
+# get a vector of colors for the lines that are in the experiment
+color_links = data.frame(sample = epi_tree$tip.label) %>% full_join(list_biome) %>% 
+  mutate(biome = replace_na(biome, "no")) %>%
+  mutate(color = ifelse(biome=="yes", met.brewer("Egypt")[3], "gray"),
+         size = ifelse(biome=="yes", 40, 20))
+
+# save
+{
+png(file="figures/tree_comparison.png", width=8000, height=8000, pointsize = 40)
+  
+plot(eR_cophylo, 
+     link.type="curved", 
+     link.lwd=color_links$size,
+     link.lty="solid", 
+     link.col=make.transparent(color_links$color, 0.6),
+     fsize=1,
+     lwd=10,
+     cex=20)
+
+dev.off()
+  }
+
+# perform mantel test
+dist_mat = as.matrix(dist(t(all_matrix[,-c(1:5)]) ))
+phylo_mat = cophenetic(epi_tree)
+
+# check if the order is the same
+all(rownames(dist_mat) == rownames(phylo_mat))
+all(colnames(dist_mat) == colnames(phylo_mat))
+# reorder
+order = colnames(dist_mat)
+dist_mat = dist_mat[order, order]
+phylo_mat = phylo_mat[order, order]
+
+# check again
+all(rownames(dist_mat) == rownames(phylo_mat))
+all(colnames(dist_mat) == colnames(phylo_mat))
+
+# get p value
+mantel(dist_mat, phylo_mat)
+# R = 0.7558
+# P = 0.001
+
+# compute the pairwise differences to the other samples
+# null hypothesis: the euclidean and phylogenetic distances between and across the epiRILs are similar as expected by chance
+dist_both = melt(dist_mat, value.name = "euclidean_dist") %>% left_join(melt(phylo_mat, value.name = "phylo_dist"), by = c("Var1", "Var2"))
+
+colnames(dist_both) = c("line1", "line2", "Euclidean", "Phyloepigenetic")
+
+dist_both = dist_both %>% mutate(line1_biome = ifelse(line1 %in% list_biome$sample, "yes", "no"),
+                     line2_biome = ifelse(line2 %in% list_biome$sample, "yes", "no"),
+                     type = ifelse(line1_biome == "yes" & line2_biome == "yes", "intraspecific", 
+                                   ifelse((line1_biome == "yes" & line2_biome == "no") | (line1_biome == "no" & line2_biome == "yes"), "interspecific", "out"))
+                     )
+
+# relevel factors
+dist_both$type = factor(dist_both$type, levels = rev(c("out", "interspecific", "intraspecific")) )
+
+# plot
+dist_both %>% dplyr::select(-c(line1_biome, line2_biome)) %>% 
+  filter( Euclidean > 2500) %>%
+  filter( Phyloepigenetic < 0.5) %>%
+  melt(id.vars = c("line1", "line2", "type")) %>% 
+  distinct() %>% 
+  ggplot() +
+  geom_density(aes(value, fill=type, color=type), alpha=0.2) +
+  facet_wrap(~variable, ncol = 2, scales = "free") +
+  labs(x="Pairwise distance", y="Density", fill="Comparison", color="Comparison") +
+  scale_fill_manual(values = met.brewer("Java")[c(1,3,5)]) +
+  scale_color_manual(values = met.brewer("Java")[c(1,3,5)]) +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size=20),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 10),
+        panel.border = element_rect(color = "black", fill=NA, size=1),
+        panel.spacing = unit(1, "lines")
+        ) 
+
+ggsave("figures/distance_allvsexp.png", width = 8, height = 4, dpi = 600)
+
+
+# calculate p value of the effect, removing outliers that violate the distribution
+summary(lm(Phyloepigenetic ~ type, data = distinct(dist_both) %>% filter(Phyloepigenetic < 0.5 ))) # significant P<0.001
+summary(lm(Euclidean ~ type, data = distinct(dist_both) %>% filter(Euclidean > 2500))) # P = 0.1433, not significant
+```
+
+
+```{r pi calculation}
+# First using all samples
+all_bin = read.table("data/all_bin.tsv", header = T)
+filter(all_bin, context=="CHH")
+# Do calculation for each context
+all_pi = rbind(
+pi_epi(filter(all_bin, context=="CG"), 10),
+pi_epi(filter(all_bin, context=="CHG"), 10),
+pi_epi(filter(all_bin, context=="CHH"), 10)
+)
+
+# Plot
+ggplot(filter(all_pi, !chr=="M")) +
+  geom_line(aes(x=end, y=epi_pi, color=context), size=1) +
+  facet_grid(context ~ chr , scales = "free") +
+  scale_color_manual(values = met.brewer("Egypt", 3)) +
+  labs(x="Chromosome postion", y= expression(paste(""^"epi", "", pi))) +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 20),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA),
+        panel.spacing = unit(1, "lines")) 
+
+ggsave("figures/all_pi.png", width = 18, height = 6, dpi = 600)
+
+# select only the lines from the experiment
+exp_bin = all_bin[, c(colnames(all_bin[,1:5]), intersect(colnames(all_bin), list_biome$sample))]
+
+# calculate pi
+exp_pi = rbind(
+pi_epi(filter(exp_bin, context=="CG"), 10),
+pi_epi(filter(exp_bin, context=="CHG"), 10),
+pi_epi(filter(exp_bin, context=="CHH"), 10)
+)
+
+# plot
+ggplot(filter(exp_pi, !chr=="M")) +
+  geom_line(aes(x=end, y=epi_pi, color=context), size=1) +
+  facet_grid(context ~ chr , scales = "free") +
+  scale_color_manual(values = met.brewer("Egypt", 3)) +
+  labs(x="Chromosome postion", y= expression(paste(""^"epi", "", pi))) +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 20),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA),
+        panel.spacing = unit(1, "lines")) 
+
+ggsave("figures/exp_pi.png", width = 18, height = 6, dpi = 600)
+
+# compare the diversity from both datasets, context-wise manner
+comparison_pi = all_pi %>% left_join(exp_pi[, c("block", "context", "epi_pi")], by=c("block", "context")) %>%
+  rename("pi_all" = "epi_pi.x", "pi_exp" = "epi_pi.y") 
+
+  ggplot(comparison_pi) +
+  geom_point(aes(pi_exp, pi_all, color=context), alpha=0.6) +
+  geom_smooth(aes(pi_exp, pi_all), method = "lm", color="gray4") +
+  facet_wrap(~context, nrow = 1, scales = "free") +
+  scale_color_manual(values = met.brewer("Egypt", 3)) +
+  labs(x=expression(paste("Experiment lines "^"epi", "", pi)), y= expression(paste("All lines "^"epi", "", pi))) +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 20),
+        panel.border = element_rect(color = "black", fill=NA),
+        panel.spacing = unit(1, "lines")) 
+
+ggsave("figures/exp_vs_all_pi.png", width = 11, height = 4, dpi = 600)
+
+# perform a LMM
+hist(comparison_pi$pi_all)
+descdist(comparison_pi$pi_all, discrete = F)
+# it is not a normal distribution, but can't be beta either
+# based on the shape I can use poisson but the variable doesn't represent counts
+
+summary(lm(pi_exp ~ pi_all, data = comparison_pi))$coefficients
+summary(glm(pi_exp ~ pi_all, data = comparison_pi), family = poisson(link = "log"))$coefficients
+
+# all models show significance but the statistical procedure may be biased
+
+``` 
+
+
+```{r conservation score}
+
+# percentage of changes of a DMR in the exp population based on the binary status
+# why only in my experiment? bc Ill focus in a DMR invididual basis and I need to remove DMRs that are always the same
+# DEFINITION: The proportion of individuals where the focus DMR is methylated
+dmr_con = data.frame(exp_bin[,1:5], score = rowSums(exp_bin[, 6:ncol(exp_bin)])/22)
+# Surprisinly, the lowest is 4% !!!
+nrow(filter(dmr_con, score==1)) # 22,213 DMRs don't change, which is the 67% of the total DMRs
+nrow(filter(dmr_con, score<0.8 & score>0.2)) # Only 2,372 pass a filter of 0.8 for polymorphism 
+
+# Plot
+ggplot(filter(dmr_con, !chr_dmr=="M")) +
+  geom_jitter(aes(x=start_dmr, y=score, color=context), size=2, alpha=0.6) +
+  facet_wrap(~chr_dmr, nrow = 1, scales = "free_x") +
+  scale_color_manual(values = met.brewer("Egypt", 3)) +
+  labs(x="Chromosome position", y= "Conservation score", color="Context") +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 20),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA),
+        panel.spacing = unit(1, "lines")) 
+
+ggsave("figures/exp_score.png", width = 18, height = 6, dpi = 600)
+
+# Now check distributions
+
+ggplot(filter(dmr_con, !chr_dmr=="M", score<0.8 & score>0.1)) +
+  geom_density(aes(x=score, color=context, fill=context), alpha=0.6) +
+  scale_fill_manual(values = met.brewer("Egypt", 3)) +
+  scale_color_manual(values = met.brewer("Egypt", 3)) +
+  labs(x="Conservation score", y= "Density", color="Context", fill="Context") +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 20),
+        panel.border = element_rect(color = "black", fill=NA)
+        ) 
+
+ggsave("figures/exp_score_dist.png", width = 5, height = 5, dpi = 600)
+```
+
+
+```{r future}
+# make the file less heavy
+test = filter(root_leaf, id_dmr %in% c("dmr_1_CG",
+                                       "dmr_12_CG",
+                                       "dmr_85_CG",
+                                       "dmr_124_CHH"))
+# make a list of tables
+list_test = list()
+list_test = split(test, test$id_dmr)
+list_test = split(root_leaf, root_leaf$id_dmr)
+
+# it works!
+plan(multisession, workers = 4)
+list_test %>% future_lapply(\(table) {
+                                      head(table, n=1)
+                                      }, future.chunk.size = 1) %>% 
+              bind_rows()
+
+plan(sequential)
+
+
+dm_fb = function(test) {
+      
+    # Do analysis
+      if (sd(filter(test, tissue=="root")$mean_mC)== 0 && sd(filter(test, tissue=="root")$mean_mC)== 0) {
+          # if there is not variance then perform a Fisher exact test
+        p.val = fisher_p(mean(filter(test, tissue=="root")$mean_mC), mean(filter(test, tissue=="leaf")$mean_mC))
+        test = "fisher"
+      }
+      
+      else {
+      # Perform Beta Regression and store p.value
+        p.val = summary(betareg(mean_mC ~ tissue, data = test, link = "logit"))$coefficients$mean[,4][2]
+        test = "beta_regression"
+      }
+    
+      # Print results 
+      c(current_DMR, p.val, test)
+  
+}
+
+```
+
+
+
+# 2 .- Quantitative genetics functions and estimation for rosette weight
+
+
+```{r heritability of the rosette weight}
+# Read data from the first experiment
+exp = read_excel("data/epiRILs_data.xlsx", sheet = "data", na = "NA")
+
+# load data from the Microbiomes
+list_biome = data.frame(sample = paste("eR", read.table("data/list_epiRILs_microbiome.txt", header = F)$V1, sep = "")) %>% mutate(biome = "yes")
+
+# add new column to make intersections and re-roganize
+# I removed the columns that I know have litte or no effect on the plant, also information about lines that I didn't use
+# I removed the size since it's correlated to the weight and I assume there is a lot of human error in the measurements
+# then I selected data from the lines I extracted microbiome
+# I converted the row into a character so it can be used a cathegorigal and not continuos
+exp = exp %>% 
+      mutate(sample = paste("eR", epiRIL, sep = ""), 
+             position = paste("r", row, sep = "_"),
+             block = paste("t", tray, sep = "_")) %>% 
+      relocate(sample, ID, position, block, .before = epiRIL) %>%
+      dplyr::select(-c(replicate, epiRIL, survival, col, tray, flower, size, row)) %>% 
+      filter(sample %in% list_biome$sample)
+
+# check and normalize the distribution of the variable
+hist(exp$fresh_weight_mg)
+shapiro.test(exp$fresh_weight_mg) 
+# it's not normally distributed
+# to find the best normalization (recommended by Santi)
+bestNormalize(exp$fresh_weight_mg) # Box-Cox or Yeo-Johnson
+
+# try boxcox
+hist(bestNormalize::boxcox(exp$fresh_weight_mg)$x.t)
+shapiro.test(bestNormalize::boxcox(exp$fresh_weight_mg)$x.t)
+# it's normal!
+
+# apply the transformations
+exp = exp %>% mutate(rosette_weight = bestNormalize::boxcox(fresh_weight_mg)$x.t)
+
+# Model a Random Effects LM with Restricted ML
+# First I used this variable to make and try my functions and models, once it was done I removed it and used the same functions as for the microbiomes to ensure the same variables
+
+exp = melt(exp,
+     id.vars = meta_cols,
+     variable.name = "pheno_name",
+     value.name = "phenotype")
+
+# Association
+as.data.table(filter(exp, pheno_name=="rosette_weight"))[, rbindlist(list(epi_AS(.SD, formula_AS))), by = pheno_name]
+
+# Heritability
+exp = as.data.table(filter(exp, pheno_name=="rosette_weight"))[, rbindlist(list(epi_H(.SD, formula))), by = pheno_name]
+
+exp = exp %>% mutate(performance = ifelse(residuals_norm_p > 0.01 & het_test_p > 0.05, round(ratio_test_p, digits = 3), "n.v"),
+                                                performance = ifelse(performance > 0.05 & performance != "n.v", "n.s", performance),
+                                                performance = ifelse(performance < 0.05 & is.character(performance) != F, paste("p =", performance), performance),
+                     performance = ifelse(performance == 0, "< 0.001", performance)) %>%
+                       melt(id.vars = c("pheno_name", "performance"),
+                       measure.vars = c("heritability", "residuals", "experimental") ) %>%
+                       mutate(value = ifelse(value==0, NA, value))
+
+exp$variable = factor(exp$variable, levels = c("experimental", "residuals", "heritability"))
+# I had to relax the threshold for the normality of the residuals
+
+# plot
+ggplot(exp) +
+  geom_bar(aes(y=pheno_name, x=value, fill=variable), stat = "identity", color="black", width = 0.6) +
+  geom_text(aes(y=pheno_name, x=value, fill = variable, label = value), size = 4, position = position_stack(vjust = 0.5), color="white") +
+  geom_text(aes(y=pheno_name, x=110, label=performance), vjust=0) +
+  scale_fill_manual(values = palette_H,
+                    limits = c("heritability", "residuals", "experimental")) +
+  scale_x_continuous(breaks = c(0, 50, 100)) +
+  labs(x= "Variance explained (%)", y= NULL) +
+  theme_bw() +
+  theme(legend.position = "top",
+        axis.text = element_text(size=20),
+        axis.title = element_text(size=20),
+        axis.ticks.y = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x.bottom = element_line(color = 'black')
+        ) 
+
+ggsave("figures/heritability_weight.png", width = 9, height = 4, dpi = 600)
+  
+```
+
+
+```{r dmr-based heritability of the rosette weight}
+# read data
+exp_matrix = read.table("data/exp_matrix.tsv", header = T)
+
+# get unwanted DMRs
+# for the continous info, only remove DMRs that are DM in roots
+clean_matrix = filter(exp_matrix, !id_dmr %in% filter(dm_all, status == "dm")$id_dmr)
+
+# select lines in my experiment
+# only keep the information about the id of the dmr
+clean_matrix = clean_matrix[, c("id_dmr", intersect(colnames(clean_matrix), list_biome$sample))]
+
+# transpose and transform to make it usable
+transpose(clean_matrix)
+trans_matrix = data.frame(t(clean_matrix[,-1]))
+colnames(trans_matrix) = clean_matrix$id_dmr
+trans_matrix = trans_matrix %>% mutate(sample = rownames(trans_matrix)) %>% relocate(sample)
+
+# needs a trans_matrix table with DMR information (column one should be )and,
+# a pheno_matrix data with the experimental desing and the phenotypic values normalized
+pheno_matrix = exp[, c("sample", "ID", "position", "harv_date", "harv_pers", "t_weight")]
+  
+
+# calculate dmr-based heritability
+
+genome_h = function(trans_matrix, pheno_matrix, pheno_name) {
+  
+  # make a list to iterate over DMRs
+  list_dmrs = colnames(trans_matrix[,-1])
+  # make an empty list to store all data
+  heritability_list = list()
+  
+  # now iterate
+for (i in seq_along(list_dmrs)) {
+
+          #current_DMR = "dmr_1_CG"
+          #current_pheno = "t_weight"
+          current_pheno = pheno_name
+          current_DMR = list_dmrs[[i]]
+            
+          # select phenotype and DMR data for the model
+          dmr_data = trans_matrix[, c("sample", current_DMR)]
+          colnames(dmr_data) = c("sample", "mC")
+          
+          pheno_data = pheno_matrix[, c("sample", "ID", "position", "harv_date", "harv_pers", current_pheno)]
+          colnames(pheno_data) = c("sample", "ID", "position", "harv_date", "harv_pers", "phenotype")
+          
+          # merge information obout the experiment, use left join to only select data from the lines we have
+          # do dmr -> pheno direction
+          model_data = dmr_data %>% left_join(pheno_data, by="sample")
+          
+          # perform the model
+          # add +1 to avoid 0s
+          model = lmer(phenotype ~ (1|mC) + (1|position) + (1|harv_date) + (1|harv_pers), data = model_data, REML = T)
+          heritability = DMR_heritator(model)
+          heritability = heritability %>% mutate(id_dmr = current_DMR,
+                                                 phenotype = current_pheno)
+          
+          # save results to the list
+          heritability_list[[current_DMR]] = heritability
+          
+          }
+  
+      # Print output
+      as.data.frame(do.call(rbind, heritability_list))
+      
+}
+
+# It does around 600 DMRs per minute
+test = genome_h(trans_matrix, pheno_matrix, "t_weight")
+#test = as.data.frame(do.call(rbind, heritability_list))
+
+# select well-fit models
+test2 = filter(test, 
+               heritability > residuals,
+               ratio_test_p < 0.05, 
+               residuals_norm_p > 0.05,
+               het_test_p > 0.05) 
+
+test2 = test2 %>% dplyr::select(id_dmr, heritability, technical, residuals) %>% left_join(exp_matrix[,1:5], by="id_dmr")
+
+
+ggplot(test2) +
+  geom_line(aes(y = heritability, x = start_dmr, color=context), size=1, aplha=0.8) +
+  geom_point(aes(y = heritability, x = start_dmr, fill=context), size=4, shape=21) +
+  facet_grid(context ~ chr_dmr, scales = "free_x") +
+  scale_color_manual(values = met.brewer("Egypt")) +
+  scale_fill_manual(values = met.brewer("Egypt")) +
+  labs(x="Chromosome position", y= expression(paste(""^"DMR", " heritability (%)"))) +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 20),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA),
+        panel.spacing = unit(0.5, "lines")) 
+
+ggsave("figures/heritability_weight_genome.png", width = 18, height = 6, dpi = 600)
+
+
+# dmr_2388_CG Chr 1 has the highest heritability (77%) its located within a gene (AT1G32700) that is a TF responsible for growth
+
+filter(exp_matrix, id_dmr=="dmr_2388_CG")[, -c(1:3,5)] %>% melt(id.vars = "id_dmr", variable.name = "sample") %>% full_join(exp, by="sample") %>% group_by(sample) %>% mutate(var_w = sd(t_weight)) %>% ungroup() %>% ggplot() +
+  geom_point(aes(value, var_w), size=4) +
+  geom_smooth(aes(value, var_w), method = "lm", alpha=0.6, color="gray40") + 
+  labs(x = "DMR methylation (%)", y= expression(paste("Rosette weight ", sigma))) +
+  theme_bw() +
+  theme(text = element_text(size = 20),
+        panel.border = element_rect(color = "black", fill=NA)) 
+
+ggsave("figures/dmr_2388_CG_vs_weight.png", width = 5, height = 5, dpi = 600)
+```
+
+
+```{r optimazing the H/GWAS function}
+# first create the block file
+block = exp[, -4] %>% left_join(trans_matrix, by = "sample") %>% drop_na()
+
+# save block column names to always use them
+block_backbone = colnames(block[,1:5])
+dmr_columns = colnames(block)[grep("dmr", colnames(block))]
+pheno_columns = colnames(block)[!colnames(block) %in% c(block_backbone, dmr_columns)]
+
+# round the numeric columns to make calculation more efficient
+block = data.frame(block[,1:5], round(block[, 6:ncol(block)], digits = 2) )
+
+# transform the data, first for the DMRs
+block = melt(block, 
+             id.vars = c(block_backbone, pheno_columns), 
+             measure.vars = dmr_columns,
+             value.name = "mC",
+             variable.name = "id_dmr")
+
+# now with the phenos
+block = melt(block, 
+             id.vars = c(block_backbone, "mC", "id_dmr"), 
+             measure.vars = pheno_columns,
+             value.name = "phenotype",
+             variable.name = "pheno_name")
+
+# create a new column to iterate over DMRxPhenotype 
+block = block %>% mutate(group = paste(pheno_name, id_dmr, sep = "_X_"))
+
+# subset 1000 to measure time, then go with al of them
+# subset_dmrs = list_dmrs[1:1000]
+
+#block = filter(block, id_dmr %in% subset_dmrs, pheno_name == "t_weight")
+block = filter(block, pheno_name == "t_weight")
+
+length(levels(as.factor(block$group)))
+
+
+# measure time
+# start.time = Sys.time()
+# work
+# test2 = as.data.table(block)[, rbindlist(list(DMR_heritator(.SD))), by = group]
+#
+#end.time = Sys.time()
+#time.taken = end.time - start.time
+#time.taken
+# ~ 1.6 minutes for 1000 DMRs
+
+# with future it takes forever!
+# This is a bit more efficient than my last function, so i'll use for the future
+
+
+# Try the GWAS performance
+start.time = Sys.time()
+# work
+test2 = as.data.table(block)[, rbindlist(list(DMR_GWAS(.SD))), by = group]
+#
+end.time = Sys.time()
+time.taken = end.time - start.time
+time.taken
+
+
+# GWAS is a bit faster since we only fit one model
+# adjust p values of the result
+test_stat = test2 %>% 
+            group_by(pheno_name) %>% 
+            mutate(adj_p = p.adjust(test_p, method = "fdr"))
+
+# remove bad models
+test_stat = filter(test_stat, 
+                   residuals_norm_p > 0.5,
+                   het_test_p > 0.05)
+
+# add the coordinates and plot
+test_stat %>% left_join(exp_matrix[,1:5], by="id_dmr") %>% 
+  filter(!chr_dmr == "M") %>% 
+  ggplot +
+  geom_point(aes(y = -log10(adj_p), x = start_dmr, color=context), size=2, alpha=0.6) +
+  facet_grid(~ chr_dmr, scales = "free_x") +
+  scale_color_manual(values = met.brewer("Egypt")) +
+  labs(x="Chromosome position", y= "-log10P", color="DMR context") +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 20),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA),
+        panel.spacing = unit(0.5, "lines")) 
+
+ggsave("figures/egwas_weight_.png", width = 18, height = 3, dpi = 600)
+```
+
+
+# 3 .- Microbiome analysis
+
+
+## 3.1 .- Rhizospheric Fungi
+
+
+```{r its metadata}
+# create a table with the metadata and the files
+its_seq = as.tibble(list.files("raw/its", full.names = T)) %>% 
+                  dplyr::rename("path" = "value") %>% 
+                  tidyr::separate(path, c("ID", "type", "gene"), sep = c("_"), remove = F) %>% 
+                  mutate(read = str_extract(gene, "[1/2]"),
+                         gene = gsub(".[1/2].fq", "", gene),
+                         ID = gsub("raw/its/", "", ID)) %>%
+                  mutate(out_path = paste("clean/its/", ID, "_", read, ".fastq", sep = "") )
+```
+
+
+```{r its quality}
+# visualize the quality of 12 random samples, first the forward read
+plotQualityProfile(sample(filter(its_seq, read == 1)$path, size = 12))
+ggsave("figures/its_quality_forward.png", width = 10, height = 7, dpi = 600)
+
+# now the reverse
+plotQualityProfile(sample(filter(its_seq, read == 2)$path, size = 12))
+ggsave("figures/its_quality_reverse.png", width = 10, height = 7, dpi = 600)
+```
+
+
+```{r its quality filtering and trimming}
+# Perform the filtering, using the parameters recommended in Niklas tutorial
+# to consider https://github.com/Zymo-Research/figaro
+
+its_filter_out = filterAndTrim(filter(its_seq, read == 1)$path, # Path of the Forward reads
+                              filter(its_seq, read == 1)$out_path, # Output path, Forward
+                              filter(its_seq, read == 2)$path, # Reverse Reads, raw
+                              filter(its_seq, read == 2)$out_path, # Output path, Reverse
+                              truncLen = c(220,210), # Truncation. First value is for forward, second is for reverse read
+                              maxN=0, # Maximum N (uncalled bases) allowed. None. Do not change
+                              truncQ=2, # Quality trimming
+                              maxEE = c(2,5), # Error filter, due low quality of reverse reads, this was relaxed
+                              rm.phix=TRUE, # Remove phiX spike-ins
+                              compress=TRUE, 
+                              multithread=TRUE,
+                              n=5e6)
+
+# some samples have very low number of reads, but will try first with these filters as don't want to have many errors
+```
+
+
+```{r its error learning}
+# Error rate estimation
+# estimates the rate of transitions between different bases during sequencing
+# do it independently for each read
+its_err_for = learnErrors(filter(its_seq, read == 1)$out_path, multithread=TRUE) 
+its_err_rev = learnErrors(filter(its_seq, read == 2)$out_path, multithread=TRUE) 
+
+plotErrors(its_err_for, nominalQ=TRUE)
+plotErrors(its_err_rev, nominalQ=TRUE)
+```
+
+
+```{r its correction and merging}
+# dereplication, getting uniq sequences
+its_derep_for = derepFastq(filter(its_seq, read==1)$out_path)
+its_derep_rev = derepFastq(filter(its_seq, read==2)$out_path)
+# get the IDs back
+names(its_derep_for) = filter(its_seq, read==1)$ID
+names(its_derep_rev) = filter(its_seq, read==2)$ID
+
+# DADA2 infers sample sequences exactly and resolves differences with a quality-aware model of Illumina amplicon errors
+# also known as the de-noising step
+# do it for each read
+# it infers true sequence variants from the unique sequences
+its_dada_for = dada(its_derep_for, err=its_err_for, multithread=TRUE)
+its_dada_rev = dada(its_derep_rev, err=its_err_rev, multithread=TRUE)
+
+# merge and create full-lenght contigs 
+its_merged = mergePairs(its_dada_for,
+                        its_derep_for,
+                        its_dada_rev,
+                        its_derep_rev,
+                        verbose = F)
+
+# make a sequence table
+its_seqtab = makeSequenceTable(its_merged)
+dim(its_seqtab)
+# only 64 ASVs
+
+# remove chimaeras
+its_clean_table = removeBimeraDenovo(its_seqtab, multithread = TRUE, method="consensus")
+# 62 ASVs remain
+
+```
+
+
+```{r its taxonomic assignation and phylogenetics}
+# Using the UNITE database
+# https://doi.plutof.ut.ee/doi/10.15156/BIO/2938067
+its_taxa = assignTaxonomy(its_clean_table, "ref/sh_general_release_dynamic_25.07.2023.fasta", 
+                          multithread=TRUE, 
+                          tryRC=TRUE,
+                          minBoot = 80)
+# UNITE fungal taxonomic reference detected.
+
+# get seqs and add an arbitrary id to each
+its_fa = getSequences(its_clean_table)
+names(its_fa) = its_fa 
+# aling the seqs to make a tree
+its_aln = AlignSeqs(DNAStringSet(its_fa), anchor=NA) # Align sequences
+its_aln = phyDat(as(its_aln, "matrix"),
+                      type="DNA")
+
+# make a ML tree with phargon
+# find the best model
+its_ml_tree = modelTest(its_aln)
+# fit the tree
+its_ml_tree = pml_bb(its_ml_tree, control = pml.control(trace = 0))
+plot(its_ml_tree$tree)
+
+```
+
+
+```{r its read fate}
+
+# get counts for each step
+its_reads = as.data.frame(cbind(filter(its_seq, read == 1)$ID, its_filter_out, sapply(its_dada_for, getN), sapply(its_dada_rev, getN), sapply(its_merged, getN), rowSums(its_clean_table)))
+colnames(its_reads) = c("ID", "input", "filtered", "denoisedF", "denoisedR", "merged", "final")
+# for some reason all columns are identified as character entries
+
+# plot
+its_reads %>% mutate(filtered = as.numeric(input) - as.numeric(final)) %>% 
+  melt(id.vars = "ID", measure.vars = c("filtered", "final")) %>% 
+  ggplot() +
+  geom_bar(aes(x=as.numeric(value), y=ID, fill=variable), stat = "identity") +
+  scale_fill_manual(values = c("gray", "gray4")) +
+  labs(x="Read counts", y= NULL, fill=NULL) +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 20),
+        axis.ticks.y = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x.bottom = element_line(color = 'black')
+        ) 
+
+ggsave("figures/its_reads.png", width = 10, height = 20, dpi = 600)
+```
+
+
+```{r its phyloseq ops}
+# load metadata and transform
+its_exp = read_excel("data/epiRILs_data.xlsx", sheet = "data", na = "NA")
+
+its_exp = its_exp %>% 
+          mutate(sample = paste("eR", epiRIL, sep = ""), 
+                 position = paste("r", row, sep = "_"),
+                 block = paste("t", tray, sep = "_")) %>% 
+          relocate(sample, ID, position, block, .before = harv_date) %>%
+          dplyr::select(-c(epiRIL, replicate, survival, col, tray, flower, size, row, fresh_weight_mg)) %>% 
+          filter(ID %in% its_seq$ID)
+
+# add names so it can be read by phyloseq
+rownames(its_exp) = its_exp$ID
+
+all(rownames(its_clean_table) %in% rownames(its_exp)) # all samples included
+all(rownames(its_clean_table) == rownames(its_exp)) # but not in the same order
+
+# reorder
+its_exp = its_exp[match(rownames(its_clean_table), rownames(its_exp)),]
+rownames(its_exp) = its_exp$ID # add names again
+all(rownames(its_clean_table) == rownames(its_exp)) # now they have the same order
+its_exp = as.data.frame(its_exp) # make it a df
+
+
+# merge all data into one object
+its_phy = phyloseq(otu_table(its_clean_table, taxa_are_rows =F),
+                  tax_table(its_taxa))
+
+# somehow it didn't match at the end so i'll iterate the operation to add the metadata and the tree
+rownames(its_exp) = sample_names(its_phy)
+
+its_phy = phyloseq(otu_table(its_clean_table, taxa_are_rows =F),
+                   sample_data(its_exp),
+                   tax_table(its_taxa),
+                   phy_tree(its_ml_tree$tree),
+                   refseq(DNAStringSet(its_fa)))
+
+# visualize abundances
+as.data.frame(its_phy@otu_table) %>% mutate(ID = rownames(its_phy@otu_table) ) %>% melt(id.vars = "ID") %>%
+  ggplot() +
+  geom_tile(aes(x=ID, y=variable, fill=log2(value))) +
+  theme(axis.text.y = element_blank())
+# there are some OTUS that are variable and common, but most of them are at low frequencies
+# visualize counts per sample
+hist(rowSums(as.data.frame(its_phy@otu_table) ))
+# it goes from below 100 to up to 800
+
+# remove samples with low counts (<100 in total)
+its_phy = prune_samples(c(sample_sums(its_phy) > 100), its_phy)
+
+# remove lines without 3 replicates
+its_phy = its_phy %>% subset_samples(sample %in% names(which(table(its_phy@sam_data$sample)==3)))
+
+
+# remove low-frequency OTUs and bad samples
+# an OTU with at least 100 counts in the total experiment
+its_phy = prune_taxa(c(taxa_sums(its_phy) > 100), its_phy)
+
+# we got 26 OTUs and 63 samples (21 lines)
+
+# plot again
+as.data.frame(its_phy@otu_table) %>% mutate(ID = rownames(its_phy@otu_table) ) %>% melt(id.vars = "ID") %>%
+  ggplot() +
+  geom_tile(aes(x=ID, y=variable, fill=log2(value))) +
+  theme(axis.text.y = element_blank())
+
+# it looks better, we can proceed for further analysis
+
+# create arbitrary names for the OTUs
+taxa_names(its_phy) = paste("OTU-F", 1:length(taxa_names(its_phy)), sep = "_")
+
+# save clean data
+saveRDS(its_phy, "its_phyloseq.rds")
+
+# clean everything but the phyloseq object
+rm(list=setdiff(ls(), "its_phy"))
+```
+
+
+```{r its diversity}
+# Not stringent filter
+its_phy = read_rds("its_phyloseq.rds")
+
+# siversity per epigenotype
+plot_richness(its_phy, x="sample", measures=c("Shannon", "Simpson"), color="sample")
+
+# visualize the diversity using the random effects
+plot_richness(its_phy, x="harv_pers", measures=c("Shannon", "Simpson"), color="harv_pers")
+plot_richness(its_phy, x="harv_date", measures=c("Shannon", "Simpson"), color="harv_date")
+plot_richness(its_phy, x="position", measures=c("Shannon", "Simpson"), color="position")
+plot_richness(its_phy, x="block", measures=c("Shannon", "Simpson"), color="block")
+
+# plot Phylum abundances
+psmelt(its_phy) %>% 
+            ungroup() %>%
+            rownames_to_column("counts") %>% 
+            group_by(ID) %>% 
+            mutate(counts = as.integer(counts),
+                   tss = counts*100/sum(counts)) %>%
+            ungroup() %>% 
+            group_by(ID, Phylum) %>%
+            mutate(phylum_tss = sum(tss)) %>% 
+            ungroup() %>% 
+            dplyr::select(sample, ID, Phylum, phylum_tss) %>% 
+            distinct() %>%
+  ggplot() +
+  geom_bar(aes(ID, phylum_tss, fill=Phylum), stat="identity") +
+  scale_fill_viridis_d(na.value = "grey")
+
+# calculate alpha diversity, I removed Chao and Fisher as they didn't work
+its_diversity = alpha_beta_div_its(its_phy)
+
+its_diversity = melt(its_diversity,
+                   id.vars = meta_cols,
+                   variable.name = "pheno_name",
+                   value.name = "phenotype")
+
+# assuming normal distributions of alpha diversity values, do simple linear models to test with anova 
+# compute the fixed effect of each factor
+as.data.table(its_diversity)[, rbindlist(list(diversity_factor_lm(.SD))), by = pheno_name] %>%
+  mutate(p_val = p_val + 0.0001) %>%
+  ggplot() +
+  geom_tile(aes(factor, pheno_name, fill=-log10(p_val))) +
+  scale_fill_viridis_c(na.value = "white", option="mako") +
+  labs(x=NULL, y=NULL, fill=expression(-log[10](P)))+
+  theme_bw() +
+  theme(axis.text = element_text(size=20)
+    ) 
+ggsave("figures/its_fixed_factors.png", width = 12, height = 8, dpi = 600)
+
+
+# calculate heritability and make associations
+its_comm_H = as.data.table(its_diversity)[, rbindlist(list(epi_H(.SD, formula))), by = pheno_name]
+post_H(its_comm_H, 0.05, c("red4", "black"))
+
+# now the association
+its_comm_AS = as.data.table(its_diversity)[, rbindlist(list(epi_AS(.SD, formula_AS))), by = pheno_name]
+post_AS(its_comm_AS, 0.05, c("red4", "black"), T)
+
+# merge plots
+post_H(its_comm_H, 0.05, c("red4", "black")) %>% insert_right(post_AS(its_comm_AS, 0.05, c("red4", "black"), F), width = 0.6)
+ggsave("figures/its_comm.png", width =18, height = 6, dpi = 600)
+
+
+# The heritable and positively associated measurement was the beta untransformed MDS1 with Bray-Curtis, so I'll plot that one
+as.data.frame(ordinate(its_phy, method = "MDS", distance = "bray")$vectors[,1:2]) %>% 
+  rownames_to_column("ID") %>% 
+  left_join(its_phy@sam_data, by="ID") %>% 
+  group_by(sample) %>%
+  mutate(min_beta = min(Axis.1),
+         max_beta = max(Axis.1)) %>%
+  ungroup() %>%
+  ggplot() +
+  geom_segment(aes(x=sample, xend = sample, y=min_beta, yend=max_beta, color=sample),size=2) +
+  geom_point(aes(sample, Axis.1, fill=sample), shape=21, size=6) +
+  scale_fill_manual(values = met.brewer("Cross", 21)) +
+  scale_color_manual(values = met.brewer("Cross", 21)) +
+  labs(x="Epigenotype", y= "Bray-Curtis MDS1", fill = "Epigenotype") +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 20),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 15),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size = 2)
+        ) 
+
+
+ggsave("figures/its_beta.png", width = 12, height = 6, dpi = 600)
+
+```
+
+
+```{r its heritability and association}
+its_phy = read_rds("its_phyloseq.rds")
+# first i tried using the CSS normalization
+# then i tried the VST normalization and kept the one with better models
+
+# transform data and merge experiment info
+# the CSS transformation replaced the "-" to "." so we have to chnage it
+# models with CSS transformation are very biased, none passed the filters
+
+# 7 non-redundant OTUs, 6 genera, 5 families, 4 orders, 22 phenotypes to test
+its_tip = tip_glom(its_phy, h=0.5)
+
+# Glom at the Genus level
+its_genus = tax_glom(its_phy,
+                     taxrank = "Genus",
+                     NArm =TRUE
+                     )
+# rename table, since the names already include the symbol of the taxonomic level, only replace
+colnames(its_genus@otu_table) = gsub("g_", "Genus" , gsub(" ", "_", as.data.frame(its_genus@tax_table)$Genus))
+
+# Glom at the family level
+its_fam = tax_glom(its_phy,
+                   taxrank = "Family",
+                   NArm =TRUE
+                   )
+# rename table
+colnames(its_fam@otu_table) = gsub("f_", "Family" , gsub(" ", "_", as.data.frame(its_fam@tax_table)$Family))
+colnames(its_fam@otu_table) = gsub("_fam", "" , colnames(its_fam@otu_table)) # correct one name
+
+# Glom at the Order level
+its_order = tax_glom(its_phy,
+                     taxrank = "Order",
+                     NArm =TRUE
+                     )
+# rename table
+colnames(its_order@otu_table) = gsub("o_", "Order" , gsub(" ", "_", as.data.frame(its_order@tax_table)$Order))
+
+
+# Transform counts, merge and add metadata
+its_pheno = VSTPhy(its_tip) %>% 
+                   left_join(VSTPhy(its_genus), by="ID") %>%
+                   left_join(VSTPhy(its_fam), by="ID") %>%
+                   left_join(VSTPhy(its_order), by="ID")
+
+rm(its_tip, its_genus, its_fam, its_order)
+its_pheno = its_pheno %>% left_join(as.data.frame(its_phy@sam_data), by="ID") %>% relocate(meta_cols, .before = ID)
+
+# melt data
+its_pheno = melt(its_pheno,
+                   id.vars = meta_cols,
+                   variable.name = "pheno_name",
+                   value.name = "phenotype")
+
+# Heritability analysis
+its_H = as.data.table(its_pheno)[, rbindlist(list(epi_H(.SD, formula))), by = pheno_name]
+filter(its_H, residuals_norm_p > 0.05, het_test_p > 0.05) # 8 models are valid
+
+# Association
+its_AS = as.data.table(its_pheno)[, rbindlist(list(epi_AS(.SD, formula_AS))), by = pheno_name]
+filter(its_AS, residuals_norm_p > 0.05, het_test_p > 0.05) # 13 models are valid
+
+# Since I don't have many phenotypes, I will plot them all using relaxed criteria
+
+post_H(its_H, 0.05, c("red4", "black")) %>% insert_right(post_AS(its_AS, 0.05, c("red4", "black"), F), width = 0.6)
+
+ggsave("figures/its_top.png", width =18, height = 13, dpi = 600) 
+```
+
+
+## 3.2 .- Rhizospheric Bacteria
+
+
+```{r rhizo metadata and trimming}
+# merge data from both pools
+rhizo_seq = rbind(
+as.tibble(list.files("raw/16s/pool1", full.names = T)) %>% 
+                  dplyr::rename("path" = "value") %>% 
+                  tidyr::separate(path, c("ID", "type", "gene"), sep = c("_"), remove = F) %>% 
+                  mutate(read = str_extract(gene, "[1/2].fq"),
+                         read = gsub(".fq", "", read),
+                         gene = gsub(".[1/2].fq.gz", "", gene),
+                         ID = gsub("raw/16s/pool1/", "", ID)) %>%
+                  mutate(pool = 1,
+                         out_path = paste("clean/", type, "/", ID, "_", read, ".fastq", sep = "") ) ,
+
+as.tibble(list.files("raw/16s/pool2", full.names = T)) %>% 
+                  dplyr::rename("path" = "value") %>% 
+                  tidyr::separate(path, c("ID", "type", "gene"), sep = c("_"), remove = F) %>% 
+                  mutate(read = str_extract(gene, "[1/2].fq"),
+                         read = gsub(".fq", "", read),
+                         gene = gsub(".[1/2].fq.gz", "", gene),
+                         ID = gsub("raw/16s/pool2/", "", ID)) %>%
+                  mutate(pool = 2,
+                         out_path = paste("clean/", type, "/", ID, "_", read, ".fastq", sep = "") )
+)
+
+# remove endosphere samples
+rhizo_seq = filter(rhizo_seq, type == "rhizo")
+
+# visaulize quality of 12 random samples
+plotQualityProfile(sample(filter(rhizo_seq, read == 1)$path, size = 12))
+ggsave("figures/rhizo_quality_forward.png", width = 10, height = 7, dpi = 600)
+
+plotQualityProfile(sample(filter(rhizo_seq, read == 2)$path, size = 12))
+ggsave("figures/rhizo_quality_reverse.png", width = 10, height = 7, dpi = 600)
+# reverse reads are again not that good
+# I will use tight cleaning thresholds as I have plenty of reads
+
+# perform the filtering
+rhizo_filter_out = filterAndTrim(filter(rhizo_seq, read == 1)$path, # Path of the Forward reads
+                              filter(rhizo_seq, read == 1)$out_path, # Output path, Forward
+                              filter(rhizo_seq, read == 2)$path, # Reverse Reads, raw
+                              filter(rhizo_seq, read == 2)$out_path, # Output path, Reverse
+                              truncLen = c(230,220), # Truncation. First value is for forward, second is for reverse read
+                              maxN=0, # Maximum N (uncalled bases) allowed. None. Do not change
+                              truncQ=2, # Quality trimming
+                              maxEE = c(2,2), # Error filter
+                              rm.phix=TRUE, # Remove phiX spike-ins
+                              compress=TRUE, 
+                              multithread=TRUE,
+                              n=5e6)
+```
+
+As the reverse reads from the second pool (third run) are very bad and don't allow merging paired reads, I will do the whole analysis using only forward reads.
+Data and results for the merged reads from pool1 are saved as a RDS.
+
+
+```{r rhizo cleaning and merging}
+# correction
+rhizo_err_for = learnErrors(filter(rhizo_seq, read == 1)$out_path, multithread=TRUE) 
+#rhizo_err_rev = learnErrors(filter(rhizo_seq, read == 2)$out_path, multithread=TRUE) 
+
+# dereplication, getting unique sequences
+rhizo_derep_for = derepFastq(filter(rhizo_seq, read==1)$out_path)
+#rhizo_derep_rev = derepFastq(filter(rhizo_seq, read==2)$out_path)
+
+# get the IDs back
+names(rhizo_derep_for) = filter(rhizo_seq, read==1)$ID
+#names(rhizo_derep_rev) = filter(rhizo_seq, read==2)$ID
+
+# ASV identification
+rhizo_dada_for = dada(rhizo_derep_for, err=rhizo_err_for, multithread=TRUE)
+#rhizo_dada_rev = dada(rhizo_derep_rev, err=rhizo_err_rev, multithread=TRUE)
+
+# merge and create full-lenght contigs 
+#rhizo_merged = mergePairs(rhizo_dada_for,
+#                          rhizo_derep_for,
+#                          rhizo_dada_rev,
+#                          rhizo_derep_rev,
+#                          verbose = T)
+
+# make a sequence table
+#rhizo_seqtab = makeSequenceTable(rhizo_merged)
+rhizo_seqtab = makeSequenceTable(rhizo_dada_for)
+dim(rhizo_seqtab)
+# 10342 ASVs in pool1
+# 17698 ASVs in both pool1 and pool2 samples, using forward reads only
+
+# remove chimeras
+rhizo_clean_table = removeBimeraDenovo(rhizo_seqtab, multithread = 16, method="consensus")
+dim(rhizo_clean_table)
+
+# 9798 ASV in pool1
+# 15883 ASVs in both pool1 and pool2 samples, using forward reads only
+```
+
+
+```{r rhizo taxa}
+# Using the SILVA database, trying both directions from the amplicons
+# https://zenodo.org/records/4587955
+
+rhizo_taxa = assignTaxonomy(rhizo_clean_table, "ref/silva_nr99_v138.1_train_set.fa.gz", 
+                          multithread=16, 
+                          tryRC=TRUE,
+                          minBoot = 80)
+
+# add species with 100% identity
+rhizo_taxa = addSpecies(rhizo_taxa, "ref/silva_species_assignment_v138.1.fa.gz", tryRC = TRUE)
+
+# get seqs and add an arbitrary id to each
+rhizo_fa = getSequences(rhizo_clean_table)
+names(rhizo_fa) = paste("OTU-B", 1:length(rhizo_fa), sep = "_" )
+colnames(rhizo_clean_table) = paste("OTU-B", 1:length(rhizo_fa), sep = "_" )
+rownames(rhizo_taxa) = paste("OTU-B", 1:length(rhizo_fa), sep = "_" )
+
+```
+
+
+```{r rhizo track reads}
+# get counts for each step
+rhizo_reads = as.data.frame(cbind(filter(rhizo_seq, read == 1)$ID, 
+                                  rhizo_filter_out, 
+                                  sapply(rhizo_dada_for, getN),
+                                  rowSums(rhizo_clean_table)))
+
+colnames(rhizo_reads) = c("ID", "input", "filtered", "denoisedF", "final")
+
+# for some reason all columns are identified as character entries
+order = rhizo_reads[order(as.numeric(rhizo_reads$input), decreasing = TRUE),]$ID
+
+# add difference
+rhizo_reads = rhizo_reads %>% mutate("filtered out" = as.numeric(input) - as.numeric(final)) %>% 
+  melt(id.vars = "ID", measure.vars = c("filtered out", "final")) 
+
+# order based on the initial number of reads
+rhizo_reads$ID = factor(rhizo_reads$ID, levels = order)
+rm(order)
+  ggplot(rhizo_reads) +
+  geom_bar(aes(x=as.numeric(value), y=ID, fill=variable), stat = "identity") +
+  scale_fill_manual(values = c("gray", "gray4")) +
+  labs(x="Read counts", y= NULL, fill=NULL) +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 25),
+        axis.ticks.y = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x.bottom = element_line(color = 'black')
+        ) 
+  
+ggsave("figures/rhizo_reads.png", width = 10, height = 30, dpi = 600)
+```
+
+
+```{r rhizo clean and prepare the phyloseq object}
+rhizo_exp = read_excel("data/epiRILs_data.xlsx", sheet = "data", na = "NA")
+
+rhizo_exp = rhizo_exp %>% 
+          mutate(sample = paste("eR", epiRIL, sep = ""), 
+                 position = paste("r", row, sep = "_"),
+                 block = paste("t", tray, sep = "_")) %>% 
+          relocate(sample, ID, position, block, .before = harv_date) %>%
+          dplyr::select(-c(epiRIL, replicate, survival, col, tray, flower, size, row, fresh_weight_mg)) %>% 
+          filter(ID %in% rhizo_seq$ID)
+
+# add info from the soil
+rhizo_exp = rbind(rhizo_exp,
+data.frame(sample = rep("BS", 6),
+           ID = c(paste(rep("BS", 3), 1:3, sep = "-"), paste(rep("pool2-BS", 3), 1:3, sep = "-") ),
+           position = NA,
+           block = NA,
+           harv_date = NA,
+           harv_pers = NA)
+)
+
+# add info from the pool
+rhizo_exp = rhizo_exp %>% left_join(rhizo_seq[, c("ID", "pool")], by="ID") %>% distinct()
+# I removed the column after I knew the run didn't have a significant effect
+
+# add names so it can be read by phyloseq
+rownames(rhizo_exp) = rhizo_exp$ID
+
+# merge all data into one object
+rhizo_phy = phyloseq(otu_table(rhizo_clean_table, taxa_are_rows =F),
+                  tax_table(rhizo_taxa))
+
+# reorder the metadata using the order from DADA2
+rhizo_exp = as.data.frame(rhizo_exp[match(sample_names(rhizo_phy), rownames(rhizo_exp)),] )
+rownames(rhizo_exp) = rhizo_exp$ID # add names again
+
+all(rownames(rhizo_clean_table) == sample_names(rhizo_phy)) # now they have the same order
+
+# now add metadata and sequences
+rhizo_phy = phyloseq(otu_table(rhizo_clean_table, taxa_are_rows =F),
+                   sample_data(rhizo_exp),
+                   tax_table(rhizo_taxa),
+                   refseq(DNAStringSet(rhizo_fa)))
+
+# clean low-abundance OTUS
+rhizo_phy = prune_taxa(c(taxa_sums(rhizo_phy) > 100), rhizo_phy) # we get 2938 OTUS left
+# 3798 in the combined run
+
+# Clean unwanted OTUS
+# no Eukaryotic OTUS left after low-abundance removal
+# 41 Mitochondrian OTUS and 3 Chloroplastic OTUS
+# 68 without Phyla assignation
+# Calculate the percentage of organellar counts
+( sum(subset_taxa(rhizo_phy, Family == 'Mitochondria')@otu_table, na.rm = T) + sum(subset_taxa(rhizo_phy, Order == 'Chloroplast')@otu_table, na.rm = T) )*100 / sum(rhizo_phy@otu_table, na.rm = T)
+# 1.2%, very good!!!
+# 0.94%  in the combined run
+
+# If I use logical arguments, cleaning by taxa will also remove unnasigned OTUS, which is not wanted now
+# I will extract directly the unwanted OTUS and then remove them
+unwanted = c(
+rownames(subset_taxa(rhizo_phy, Family == 'Mitochondria')@tax_table), # mito
+rownames(subset_taxa(rhizo_phy, Order == 'Chloroplast')@tax_table), # chloro
+rownames(subset(as.data.frame(rhizo_phy@tax_table), is.na(Phylum))) # no phyla
+)
+rhizo_phy = prune_taxa(taxa_names(rhizo_phy)[!taxa_names(rhizo_phy) %in% unwanted], rhizo_phy) # 2826 OTUS left
+# 3637 in the merged dataset
+
+# for plotting purposes, I will add a new column to the taxa table to get only the top 10 Phylum (based on the number of OTUs)
+top_phyla = as.data.frame(table(as.data.frame(rhizo_phy@tax_table)$Phylum) ) %>%
+                          dplyr::rename("Phylum" = "Var1") %>%
+                          arrange(dplyr::desc(Freq)) %>% 
+                          mutate(Phylum = as.character(Phylum),
+                                 plot_Phylum = ifelse(row_number() < 15, Phylum, "Other"))
+
+# add data while keeping the rownames (OTU names)
+rhizo_phy = merge_phyloseq(rhizo_phy, tax_table(as.data.frame(rhizo_phy@tax_table) %>% rownames_to_column('OTU') %>% 
+  left_join(top_phyla[,c(1,3)], by="Phylum") %>% column_to_rownames('OTU') %>% as.matrix())) 
+
+
+# save the filtered sequences as fasta to make the tree
+writeXStringSet(DNAStringSet(rhizo_phy@refseq), "raw/rhizo.fa")
+
+# alignment and tree were done with mafft and iqtree since phargon takes a lot
+rhizo_tree = read.tree("raw/rhizo_contree.nw") # uptaded for the bootstrap
+
+# add tree
+rhizo_phy = merge_phyloseq(rhizo_phy, phy_tree(rhizo_tree))
+
+# save it
+saveRDS(rhizo_phy, "rhizo_phyloseq.rds")
+
+rm(top_phyla, unwanted)
+```
+
+
+```{r effect of the sequencing run}
+# I sequenced the same soil samples in the two runs, so let's see if the pooling+sequencing impacts the distribution of the abundances
+# anosim doesn't require transformations as it is non-parametric
+soils = as.data.frame(subset_samples(rhizo_phy, sample == "BS")@otu_table) %>% 
+            rownames_to_column("ID") %>% 
+            left_join(as.data.frame(rhizo_phy@sam_data), by="ID") %>%
+            dplyr::select(colnames(rhizo_phy@otu_table), pool) %>%
+            relocate(pool)
+
+anosim(soils[,-1], soils$pool, distance = "bray", permutations = 9999) 
+# R=1
+# P=0.1
+
+# no effect!
+
+rm(soils)
+```
+
+
+```{r rhizo diversity}
+# rhizo_phy = read_rds("rhizo_phyloseq_pool1-only.rds")
+rhizo_phy = read_rds("rhizo_phyloseq.rds")
+
+# calculate relative contribution of each Phylum (%) to the dataset
+psmelt(rhizo_phy) %>% 
+            rownames_to_column("counts") %>% 
+            group_by(ID) %>% 
+            mutate(counts = as.integer(counts),
+                   tss = counts*100/sum(counts)) %>%
+            ungroup() %>% 
+            group_by(ID, plot_Phylum) %>%
+            mutate(phylum_tss = sum(tss)) %>% 
+            ungroup() %>% 
+            dplyr::select(sample, ID, plot_Phylum, phylum_tss) %>% 
+            distinct() %>%
+  filter(sample != "BS") %>%
+  ggplot() +
+  geom_bar(aes(ID, phylum_tss, fill=plot_Phylum), stat="identity") +
+  scale_fill_manual(values = c(scales::viridis_pal()(14)[1:11], "gray", scales::viridis_pal()(14)[12:14]))
+# at the Phylum level there's not big chance
+
+# phylogenetic diversity
+ggtree(rhizo_phy, layout='circular', branch.length='none') + 
+    geom_tippoint(aes(color=plot_Phylum), size=6) +
+    scale_color_manual(values = c(scales::viridis_pal()(14)[1:11], "gray", scales::viridis_pal()(14)[12:14])) +
+    labs(color="Phylum")  +
+    theme(text = element_text(size=20),
+          legend.position = "bottom")
+
+ggsave("figures/rhizo_tree.png", width = 14, height = 12, dpi = 600)
+
+# diversity per epigenotype
+plot_richness(rhizo_phy, x="sample", measures=c("Shannon", "Simpson"), color="sample")
+
+# visualize the diversity using the random effects
+plot_richness(rhizo_phy, x="harv_pers", measures=c("Shannon", "Simpson"), color="harv_pers")
+plot_richness(rhizo_phy, x="harv_date", measures=c("Shannon", "Simpson"), color="harv_date")
+plot_richness(rhizo_phy, x="position", measures=c("Shannon", "Simpson"), color="position")
+plot_richness(rhizo_phy, x="block", measures=c("Shannon", "Simpson"), color="block")
+
+
+# calculate alpha diversity, 
+rhizo_diversity = alpha_beta_div(rhizo_phy) %>% filter(sample != "BS") 
+
+rhizo_diversity = melt(rhizo_diversity,
+                   id.vars = c(meta_cols, "pool"),
+                   variable.name = "pheno_name",
+                   value.name = "phenotype")
+
+# visualize distributions
+ggplot(rhizo_diversity) +
+  geom_density(aes(phenotype)) +
+  facet_wrap(~pheno_name, ncol = 1, scales = "free")
+
+# compute the fixed effect of each factor
+as.data.table(rhizo_diversity)[, rbindlist(list(diversity_factor_lm(.SD))), by = pheno_name] %>%
+  mutate(p_val = p_val + 0.0001) %>%
+  ggplot() +
+  geom_tile(aes(factor, pheno_name, fill=-log10(p_val))) +
+  scale_fill_viridis_c(na.value = "white", option="mako") +
+  labs(x=NULL, y=NULL, fill=expression(-log[10](P)))+
+  theme_bw() +
+  theme(axis.text = element_text(size=20)
+    ) 
+ggsave("figures/rhizo_fixed_factors.png", width = 12, height = 8, dpi = 600)
+
+# I added the pool as a fixed effect since all samples from pool2 had less diversity
+formula = "~ (1|sample) + (1|block) + (1|position) + (1|harv_date) + (1|harv_pers)" # I assume the variance not to be dependent on the run
+formula_AS = "~ sample * pool + (1|block) + (1|position) + (1|harv_date) + (1|harv_pers)" # while doing type II Anova, the first listed is the one tested for significance
+
+# calculate heritability and make associations
+rhizo_comm_H = as.data.table(rhizo_diversity)[, rbindlist(list(epi_H(.SD, formula))), by = pheno_name]
+post_H(rhizo_comm_H, 0.001, c("red4", "black"))
+
+# now the association
+rhizo_comm_AS = as.data.table(rhizo_diversity)[, rbindlist(list(epi_AS(.SD, formula_AS))), by = pheno_name]
+post_AS(rhizo_comm_AS, 0.001, c("red4", "black"), T)
+
+# merge plots and save
+post_H(rhizo_comm_H, 0.0001, c("red4", "black")) %>% insert_right(post_AS(rhizo_comm_AS, 0.001, c("red4", "black"), F), width = 0.6)
+ggsave("figures/rhizo_comm.png", width =18, height = 6, dpi = 600)
+
+
+# Since the only Heritable component of the community is the normalized Shannon, plot that one
+as.data.frame(estimate_richness(transform_sample_counts(rhizo_phy, function(x) x / sum(x) ), measures = "Shannon")) %>% 
+  rownames_to_column("ID") %>% 
+  left_join(rhizo_phy@sam_data, by="ID") %>% 
+  filter(sample != "BS") %>%
+  group_by(sample) %>%
+  mutate(min_Shannon = min(Shannon),
+         max_Shannon = max(Shannon),
+         mean_Shannon = mean(Shannon)) %>%
+  ungroup() %>%
+  mutate(sample = fct_reorder(sample, mean_Shannon)) %>%
+  ggplot() +
+  geom_segment(aes(x=sample, xend = sample, y=min_Shannon, yend=max_Shannon, color=sample),size=2) +
+  geom_point(aes(sample, Shannon, fill=sample), shape=21, size=6) +
+  scale_fill_manual(values = met.brewer("Cross", 47)) +
+  scale_color_manual(values = met.brewer("Cross", 47)) +
+  labs(x="Epigenotype", y= "TSS Shannon", fill = "Epigenotype") +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 20),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 15),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size = 2)
+        ) 
+
+ggsave("figures/rhizo_alpha.png", width = 18, height = 6, dpi = 600)
+```
+
+
+```{r rhizo heritability OTUs}
+rhizo_phy = read_rds("rhizo_phyloseq.rds")
+
+# 1411 non-redundant OTUs, 397 genera, 258 families, 181 orders, 2247 phenotypes to test --- in the merged reads
+# 1613 non-redundant OTUs, 429 genera, 270 families, 186 orders, 2498 phenotypes to test
+
+rhizo_tip = tip_glom(rhizo_phy, h=0.1)
+
+# Glom at the Genus level
+rhizo_genus = tax_glom(rhizo_phy,
+                       taxrank = "Genus",
+                       NArm =TRUE
+                       )
+# rename table
+colnames(rhizo_genus@otu_table) = paste("Genus", gsub(" ", "_", as.data.frame(rhizo_genus@tax_table)$Genus), sep = "_")
+
+# Glom at the family level
+rhizo_fam = tax_glom(rhizo_phy,
+                     taxrank = "Family",
+                     NArm =TRUE
+                     )
+# rename table
+colnames(rhizo_fam@otu_table) = paste("Family", gsub(" ", "_", as.data.frame(rhizo_fam@tax_table)$Family), sep = "_")
+
+# Glom at the Order level
+rhizo_order = tax_glom(rhizo_phy,
+                       taxrank = "Order",
+                       NArm =TRUE
+                       )
+# rename table
+colnames(rhizo_order@otu_table) = paste("Order", gsub(" ", "_", as.data.frame(rhizo_order@tax_table)$Order), sep = "_")
+
+
+# Transform counts, merge and add metadata
+rhizo_pheno = VSTPhy(rhizo_tip) %>% 
+                    left_join(VSTPhy(rhizo_genus), by="ID") %>%
+                    left_join(VSTPhy(rhizo_fam), by="ID") %>%
+                    left_join(VSTPhy(rhizo_order), by="ID")
+rm(rhizo_tip, rhizo_genus, rhizo_fam, rhizo_order)
+rhizo_pheno = rhizo_pheno %>% left_join(as.data.frame(rhizo_phy@sam_data), by="ID") %>% relocate(meta_cols, .before = ID)
+
+# Split soil
+soil_pheno = filter(rhizo_pheno, sample=="BS")
+rhizo_pheno = filter(rhizo_pheno, sample!="BS")
+
+# melt data
+rhizo_pheno = melt(rhizo_pheno,
+                   id.vars = c(meta_cols, "pool"),
+                   variable.name = "pheno_name",
+                   value.name = "phenotype")
+
+# melt soil data
+soil_pheno = melt(soil_pheno,
+                   id.vars = c(meta_cols, "pool"),
+                   variable.name = "pheno_name",
+                   value.name = "phenotype")
+
+# rename the Rhizobium taxa as it is very long
+rhizo_pheno$pheno_name = gsub("Allorhizobium-Neorhizobium-Pararhizobium-", "", rhizo_pheno$pheno_name)
+soil_pheno$pheno_name = gsub("Allorhizobium-Neorhizobium-Pararhizobium-", "", soil_pheno$pheno_name)
+
+# save table for the future
+write.table(rhizo_pheno, "raw/rhizosphere_phenotypes.tsv", quote = F, sep = "\t", row.names = F, col.names = T)
+
+# calculate heritability
+rhizo_H = as.data.table(rhizo_pheno)[, rbindlist(list(epi_H(.SD, formula))), by = pheno_name]
+
+# correct p.values
+rhizo_H$ratio_test_p = p.adjust(rhizo_H$ratio_test_p, method = "fdr")
+
+# 17 heritable phenotypes for pool1
+# 72 heritable for all samples
+# as an example, Rhizobium is not heritable when including all samples
+
+# select the top heritable taxa for the plot
+top_rhizo = filter(rhizo_H, residuals_norm_p > 0.05, het_test_p > 0.05, ratio_test_p < 0.001) %>% arrange(dplyr::desc(heritability))
+
+# I will only use black as I already know all models are valid, get the top ones
+post_H(filter(rhizo_H, pheno_name %in% top_rhizo$pheno_name[1:50]), 0.05, c("black"))
+
+# compute the associations
+rhizo_AS = as.data.table(rhizo_pheno)[, rbindlist(list(epi_AS(.SD, formula_AS))), by = pheno_name]
+
+# correct p.values
+rhizo_AS$test_p = p.adjust(rhizo_AS$test_p, method = "fdr")
+
+# 262 OTUS are associated with a relaxed threshold, and 105 with a stringent filter
+# 90 in the full dataset
+top_rhizo_causal = filter(rhizo_AS, residuals_norm_p > 0.05, het_test_p > 0.05, test_p < 0.001)
+
+post_AS(filter(rhizo_AS, pheno_name %in% top_rhizo_causal$pheno_name[1:50]), 0.001, c("red4", "black"), T)
+
+# merge plots fro the top 20 heritable OTUS and set performance with the stringent p value
+post_H(filter(rhizo_H, pheno_name %in% top_rhizo$pheno_name[1:20]), 0.001, c("black")) %>% 
+  insert_right(post_AS(filter(rhizo_AS, pheno_name %in% top_rhizo$pheno_name[1:20]), 0.001, c("red4", "black"), F), width = 0.6)
+
+
+ggsave("figures/rhizo_top.png", width = 18, height = 12, dpi = 600)
+```
+
+
+```{r rhizo selection}
+# compute normal means by pool
+soil_mean = soil_pheno %>% 
+                    group_by(pheno_name, sample, pool) %>%
+                    summarise(mean_soil = mean(phenotype)) %>%
+                    ungroup() %>%
+                    distinct()
+
+# compute LS means from the epiRILs
+# the more samples, the more slow it is
+#rhizo_LS = as.data.table(rhizo_pheno)[, rbindlist(list(LS_estimate(.SD))), by = pheno_name]
+
+# save table for the future
+#write.table(rhizo_LS, "raw/rhizosphere_LSmeans.tsv", quote = F, sep = "\t", row.names = F, col.names = T)
+rhizo_LS = read.table("raw/rhizosphere_LSmeans.tsv", header = T)
+
+# add pool
+rhizo_LS = rhizo_LS %>% left_join(rhizo_phy@sam_data[, c("sample", "pool")], by="sample")
+
+# SD cannot be calculated from a LMM because all SE values are expected to be the same (in principle)
+# so we will calculate SD manually
+rhizo_LS = rhizo_LS %>% left_join(rhizo_pheno %>%                     
+                                              group_by(pheno_name, sample) %>%
+                                              summarise(sd_phenotype = sd(phenotype)) %>%
+                                              ungroup() %>%
+                                              distinct(),
+                                  by = c("sample", "pheno_name"))
+
+# merge means from the soil 
+rhizo_LS = rhizo_LS %>% left_join(soil_mean[,c(1,3:4)], by=c("pheno_name", "pool"))
+
+# compute the delta S per sample, per phenotype, per pool
+rhizo_selection = rhizo_LS %>% 
+  group_by(sample, pheno_name, pool) %>% 
+  summarise(delta_s = (emmean - mean_soil) / sd_phenotype ) %>% 
+  ungroup() %>%
+  distinct()
+
+# approximately, 1/2 third is kept
+
+# compute the entropy and the significance
+# p value means the times the entropy was higher than what expected by chance
+# it is not big
+set.seed(1248) # due to randomization, low entropy OTUs chance their significance every time
+rhizo_entro = rhizo_selection %>% 
+                        ungroup %>% 
+                        mutate(dir = ifelse(delta_s > 2, "positive", ifelse(delta_s < -2, "negative", NA))) %>% 
+                        group_by(pheno_name, pool) %>% 
+                        summarise(p = length(which(dir == "positive")),
+                                  q = length(which(dir == "negative")),
+                                  n = n(),
+                                  entropy = s_entropy(p,q,n),
+                                  p_val = permutation_entropy(entropy, n)) 
+
+
+# correct p values
+rhizo_entro$p_val = p.adjust(rhizo_entro$p_val, method="fdr")
+
+ggplot(filter(rhizo_entro, entropy != 0)) + 
+  geom_point(aes(entropy, -log10(p_val+0.0001)))
+
+# filter the OTUS with significant entropy and that have variability in at least 20% of the samples
+top_rhizo_selection = filter(rhizo_entro, entropy!= 0, p_val > 0.01, (p+q) > n*0.2) %>% arrange(dplyr::desc(entropy)) 
+# we get 300 in pool1
+length(levels(as.factor(top_rhizo_selection$pheno_name)))
+# 368 unique in all samples, aware of the effect of the pool
+# pools 2 has more significance and entropy (9 phenotypes have p>0.95!!!!)
+
+# select those that are repeated
+as.data.frame(table(top_rhizo_selection$pheno_name)) %>% filter(Freq == 2)
+
+# 11 are repeated, we'll plot those
+top_rhizo_selection = top_rhizo_selection %>% filter(pheno_name %in% (as.data.frame(table(top_rhizo_selection$pheno_name)) %>% filter(Freq == 2) )[,1] )
+
+# subset the top 50 for the plot
+subset = filter(rhizo_selection, pheno_name %in% top_rhizo_selection$pheno_name)
+# transform values
+subset = subset %>% ungroup %>% mutate(plot_delta_s = sign(delta_s)*log2(abs(delta_s)+1))
+pivot_wider(subset[, c(1:2,5)], names_from = pheno_name, values_from = plot_delta_s) %>% column_to_rownames("sample")
+
+
+# order via UPGMA + Euclidean for the plot, using the pheatmap function
+test = pheatmap::pheatmap(pivot_wider(subset[, c(1:2,5)], names_from = pheno_name, values_from = plot_delta_s) %>% column_to_rownames("sample"))
+order_samples = test$tree_row$labels[test$tree_row$order]
+order_OTUs = test$tree_col$labels[test$tree_col$order]
+rm(test)
+
+# apply order
+subset$pheno_name = factor(subset$pheno_name, levels = order_OTUs )
+subset$sample = factor(subset$sample, levels = order_samples)
+
+
+# plot
+ent = filter(rhizo_entro, pheno_name %in% top_rhizo_selection$pheno_name) %>%
+  group_by(pheno_name) %>%
+  mutate(mean_entropy = mean(entropy)) %>%
+  ungroup() %>%
+  dplyr::select(pheno_name, mean_entropy) %>%
+  distinct() %>%
+  mutate(pheno_name = fct_reorder(pheno_name, dplyr::desc(mean_entropy)) ) %>%
+  ggplot() +
+  geom_bar(aes(y=pheno_name, x=mean_entropy), stat = "identity", fill="black") +
+  labs(y=NULL, x="Selective entropy") +
+  coord_cartesian(xlim=c(0.7, 0.9)) +
+  scale_x_continuous(breaks = c(0.7, 0.9)) +
+  theme_bw() +
+  theme(axis.text = element_text(size=20),
+          axis.title = element_text(size=20),
+          axis.ticks.x = element_blank(),
+          axis.ticks.y = element_blank(),
+          axis.text.y = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.border = element_rect(color = "black", fill=NA, size=2)
+        ) 
+
+deltas = ggplot(subset) +
+  geom_tile(aes(pheno_name, sample, fill=plot_delta_s), color="gray40") +
+  scale_fill_gradient2(low = "#009C58", high = "#851DA0", mid = "white", limits = c(-9, 9)) +
+  #scale_fill_viridis_c(option="turbo", na.value = "transparent", limits = c(-9, 9)) +
+  labs(y= "Epigenotype", fill= expression(log[2]("[\u394S]+1")("sign(\u394S)")), x= NULL) +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size=20),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 15),
+        panel.border = element_rect(color = "black", fill=NA, size=2),
+        panel.spacing = unit(1, "lines")
+        ) +
+    coord_flip()
+
+deltas %>% insert_right(ent, width = 0.1)
+
+ggsave("figures/rhizo_selection.png", width = 20, height = 8, dpi = 600)
+
+# calculate p value
+chisq.test(abs(pivot_wider(subset[, 1:5], names_from = pheno_name, values_from = delta_s) %>% column_to_rownames("sample")))
+# sigfnificant P<0.001
+
+
+# plot an example
+
+rhizo_LS %>% filter(pheno_name == "Family_Legionellaceae") %>%
+  left_join(subset, by = c("sample", "pheno_name", "pool")) %>%
+  mutate(sample = fct_reorder(sample, emmean)) %>%
+  mutate(diff = mean_soil - emmean) %>%
+  ggplot() +
+  geom_segment( aes(x=sample, xend=sample, y=mean_soil, yend=emmean, color=as.factor(pool)), size=1, linetype="dashed") +
+  geom_hline(aes(yintercept = mean_soil, color=as.factor(pool)), size=1) +
+  geom_point(aes(x=sample, y=emmean, fill=plot_delta_s), shape=21, size=8) +
+  #geom_point(aes(x=sample, y=emmean-0.15*(sign(diff)*1)), size=15, shape = 15, color="white") +
+  geom_text(aes(x=sample, y=emmean-0.15*(sign(diff)*1), label=sample), size=4) +
+  scale_fill_gradient2(low = "#009C58", high = "#851DA0", mid = "white", limits = c(-9, 9)) +
+  scale_color_manual(values = c("gray4", "gray60")) +
+  labs(y= "Normalized abundance", 
+       fill= expression(log[2]("[\u394S]+1")("sign(\u394S)")), 
+       x= NULL, 
+       color="Sequencing run", 
+       title = "Family Legionellaceae") +
+  theme_bw() +
+  theme(legend.position = "bottom",
+        text = element_text(size=20),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(size = 2),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        #axis.line.y.left = element_line(color = 'black')
+        )
+
+ggsave("figures/selection_example_1.png", width = 25, height = 6, dpi = 600)
+``` 
+
+
+```{r intersection methods}
+# make an intersection list
+top_otus = list("Heritable" = top_rhizo$pheno_name,
+                "Associated" = top_rhizo_causal$pheno_name,
+                "Directionally selected" = top_rhizo_selection$pheno_name)
+
+
+intersect(top_rhizo$pheno_name, top_rhizo_selection$pheno_name)
+intersect(top_rhizo_causal$pheno_name, top_rhizo_selection$pheno_name)
+intersect(intersect(top_rhizo$pheno_name, top_rhizo_selection$pheno_name), intersect(top_rhizo_causal$pheno_name, top_rhizo_selection$pheno_name))
+
+# count hits for each taxonomic level
+top_rhizo %>% mutate(level = str_extract(pheno_name, "OTU|Genus|Family|Order")) %>% group_by(level) %>% summarise(n = n())
+top_rhizo_causal %>% mutate(level = str_extract(pheno_name, "OTU|Genus|Family|Order")) %>% group_by(level) %>% summarise(n = n())
+
+
+# plot
+upset(fromList(top_otus),
+      nintersects = 9,
+      mainbar.y.label = "Counts",
+      sets.x.label = "Total counts", 
+      #matrix.color = met.brewer("Egypt")[2],
+      #main.bar.color = met.brewer("Egypt")[3],
+      #sets.bar.color = met.brewer("Egypt")[4],
+      #shade.color = met.brewer("Egypt")[2],
+      point.size = 10,
+      line.size = 4,
+      text.scale = c(4, 4, 4, 4, 4, 4),
+      mb.ratio = c(0.6, 0.4)
+)
+
+# save tables
+write.table(rhizo_H, "raw/rhizosphere_heritability.tsv", quote = F, sep = "\t", row.names = F, col.names = T)
+write.table(rhizo_AS, "raw/rhizosphere_association.tsv", quote = F, sep = "\t", row.names = F, col.names = T)
+write.table(rhizo_entro, "raw/rhizosphere_entropy.tsv", quote = F, sep = "\t", row.names = F, col.names = T)
+write.table(rhizo_selection, "raw/rhizosphere_selection.tsv", quote = F, sep = "\t", row.names = F, col.names = T)
+```
+
+
+```{r rhizo genome scan}
+# As I found out the run can bias the individual abundances of the OTUs, I will use the soil as a reference to remove the bias
+
+# first a try with the Family that was heriable, associated and selected for
+# the distribution seems similar to normal after applying the transformation on respect on the sequencing run
+test = rhizo_pheno %>% 
+  left_join(soil_mean[, -2], by = c("pheno_name", "pool")) %>% 
+  filter(pheno_name == "Family_Legionellaceae") %>%
+  mutate(phenotype = mean_soil - phenotype) %>% 
+  dplyr::select(-mean_soil) 
+
+
+# load data
+exp_matrix = read.table("data/exp_matrix.tsv", header = T)
+list_biome = data.frame(sample = paste("eR", read.table("data/list_epiRILs_microbiome.txt", header = F)$V1, sep = "")) %>% mutate(biome = "yes")
+
+# select lines in my experiment
+# only keep the information about the id of the dmr
+exp_matrix = exp_matrix[, c("id_dmr", intersect(colnames(exp_matrix), list_biome$sample))]
+
+# transpose and transform to make it usable
+trans_matrix = data.frame(t(exp_matrix[,-1])) %>% mutate(sample = rownames(data.frame(t(exp_matrix[,-1])))) %>% relocate(sample)
+colnames(trans_matrix) = c("sample", exp_matrix$id_dmr)
+
+# merge phenotypes and epygenotypes
+# right_join will keep only the samples with DMR info
+test = test %>% right_join(trans_matrix, by = "sample")
+dmr_columns = colnames(trans_matrix)[grep("dmr", colnames(trans_matrix))]
+
+
+test = melt(test, 
+             id.vars = c(meta_cols, "pool", "pheno_name", "phenotype"), 
+             measure.vars = dmr_columns,
+             value.name = "mC",
+             variable.name = "id_dmr")
+
+# do heritability scan
+legion = as.data.table(test)[, rbindlist(list(DMR_H(.SD))), by = id_dmr]
+
+# correct p-vals
+adjusted_legion = data.frame(legion, adj_p = p.adjust(legion$ratio_test_p, method = "holm"))
+# none is significant after correction
+
+# select valid models
+filter(adjusted_legion, residuals_norm_p > 0.05, het_test_p > 0.05, ratio_test_p < 0.05)
+
+# get locations of the dmrs
+dmr_bed = read.table("data/exp_matrix.tsv", header = T)[1:5]
+
+adjusted_legion = filter(adjusted_legion, residuals_norm_p > 0.05, het_test_p > 0.05, ratio_test_p < 0.05) %>% left_join(dmr_bed, by = "id_dmr")
+
+# plot DMR H
+ggplot(adjusted_legion) +
+  #geom_line(aes(y = heritability, x = start_dmr, color=context), size=1, aplha=0.8) +
+  geom_hline(yintercept = 0, color="black") +
+  geom_hline(yintercept = 20, size=1, linetype = "dashed", color="gray60") +
+  geom_segment(aes(x=start_dmr, xend=start_dmr, y=0, yend=heritability, color=context), size=1, linetype="solid") +
+  geom_point(aes(y = heritability, x = start_dmr, fill=context, size=-log10(ratio_test_p)), shape=21) +
+  facet_grid(~ chr_dmr, scales = "free_x") +
+  scale_color_manual(values = met.brewer("Egypt")) +
+  scale_fill_manual(values = met.brewer("Egypt"),
+                    guide = guide_legend(override.aes = list(size=6))) +
+  scale_size(range = c(0.1, 10), breaks = c(1.50, 2.25)) +
+  labs(x="Chromosome position", 
+       y=expression(paste(""^"DMR", " heritability (%)")),
+       size=expression(-log[10](P))) +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 20),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size = 1),
+        panel.spacing = unit(0.5, "lines")) 
+
+ggsave("figures/legion_genome_H.png", width = 18, height = 5, dpi = 600)
+
+# plot the heritable DMR vs the abundance, AT3G11260 Gene WOX5
+candidate = filter(test, id_dmr=="dmr_12722_CG") %>%
+  mutate(status = ifelse(mC < 15.5, "unmethylated", "methylated")) %>%
+  group_by(sample) %>%
+  mutate(Variance = var(phenotype),
+         "Relative abundance" = mean(phenotype)) %>%
+  ungroup() %>%
+  melt(id.vars = c("sample", "status"), measure.vars = c("Variance", "Relative abundance")) %>%
+  distinct()
+
+  ggplot(candidate) +
+  geom_violin(aes(status, value), fill=met.brewer("Egypt")[1], color=met.brewer("Egypt")[1], alpha=0.2) +
+  geom_jitter(aes(status, value), shape=21, fill=met.brewer("Egypt")[1], size=4, width = 0.1) +
+  facet_wrap(~variable, scales = "free") +
+  labs(x=NULL, y=NULL) +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 20),
+        axis.text.x = element_text(size=15),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size = 1),
+        panel.spacing = unit(0.5, "lines")) 
+
+ggsave("figures/legion_DMR.png", width = 8, height = 5, dpi = 600)
+
+# significance 
+hist(filter(candidate, variable == "Variance")$value)
+hist(filter(candidate, variable == "Relative abundance")$value)
+
+# not normal, so do kruskal wallis
+kruskal.test(value ~ status, data = filter(candidate, variable == "Variance")) # p = 0.36
+kruskal.test(value ~ status, data = filter(candidate, variable == "Relative abundance")) # p = 0.534
+
+###############################################################################################################
+
+# GWAS
+legion_GWAS = as.data.table(test)[, rbindlist(list(DMR_GWAS(.SD))), by = id_dmr]
+
+# correct p-vals
+adjusted_legion_GWAS = data.frame(legion_GWAS, adj_p = p.adjust(legion_GWAS$test_p, method = "fdr"))
+# smallest is 0.05 after correction
+
+# select valid models and add annotation
+adjusted_legion_GWAS = filter(adjusted_legion_GWAS, residuals_norm_p > 0.05, het_test_p > 0.05)
+adjusted_legion_GWAS = adjusted_legion_GWAS %>% left_join(dmr_bed, by = "id_dmr") %>% filter(chr_dmr != "M")
+
+# plot
+ggplot(adjusted_legion_GWAS) +
+  geom_hline(yintercept = 0, color="black") +
+  geom_hline(yintercept = -log10(0.05), size=1, linetype = "dashed", color="gray60") +
+  geom_point(aes(y = -log10(adj_p), x = start_dmr, color=context), alpha=0.6, size=2) +
+  facet_grid(~ chr_dmr, scales = "free_x") +
+  scale_color_manual(values = met.brewer("Egypt"),
+                    guide = guide_legend(override.aes = list(size=6))) +
+  labs(x="Chromosome position", 
+       y=expression(-log[10]("Adj P"))) +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 20),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size = 1),
+        panel.spacing = unit(0.5, "lines")) 
+
+ggsave("figures/legion_genome_GWAS.png", width = 18, height = 5, dpi = 600)
+
+# save tables
+write.table(adjusted_legion, "raw/legion_genome_H.tsv", quote = F, sep = "\t", row.names = F, col.names = T)
+write.table(adjusted_legion_GWAS, "raw/legion_genome_GWAS.tsv", quote = F, sep = "\t", row.names = F, col.names = T)
+```
+
+
+```{r close up to chr1 peak}
+# close-up to the associated region
+peak = filter(adjusted_legion_GWAS, chr_dmr == 1, start_dmr > 3e+6 & start_dmr < 9e+6) %>%
+  dplyr::select(id_dmr, start_dmr, adj_p, context) %>%
+  distinct(start_dmr, .keep_all = T)
+
+  ggplot(peak) +
+  geom_hline(yintercept = 0, color="black") +
+  geom_hline(yintercept = -log10(0.01), size=1, linetype = "dashed", color="gray60") +
+  geom_point(aes(y = -log10(adj_p), x = start_dmr/1e+6, color=context), alpha=0.6, size=4) +
+  scale_color_manual(values = met.brewer("Egypt"),
+                    guide = guide_legend(override.aes = list(size=6))) +
+  scale_x_continuous(limits = c(3, 9)) +
+  labs(x="Chromosome 1 position (Mb)", 
+       y=expression(-log[10]("Adj P"))) +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 20),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size = 1)
+        ) 
+
+ggsave("figures/legion_genome_GWAS_chr1.png", width = 5, height = 5, dpi = 600)
+
+# visualize methylation in the region for all the 22 lines
+peak_plus_mC %>% dplyr::select(-c(adj_p)) %>%
+  melt(id.vars = c("id_dmr", "context", "start_dmr")) %>%
+  mutate(o_start_dmr = paste("o", "start_dmr", sep = "_"), 
+         o_start_dmr = fct_reorder(o_start_dmr, start_dmr)) %>%
+  ggplot() +
+  geom_tile(aes(as.factor(start_dmr), variable, fill=context, alpha=value)) +
+  facet_wrap(~context, ncol = 1, scales = "free_y")
+# it is very complicated to actually see a thing
+
+# calculate LD and visualize methyaltion
+# only for highly associated DMRs in that region (31)
+peak_plus_mC = filter(peak, adj_p < 0.05) %>% left_join(exp_matrix, by = "id_dmr")
+
+peak_corr = t(peak_plus_mC[,-c(1:4)]) 
+colnames(peak_corr) = peak_plus_mC$id_dmr
+peak_corr = cor(peak_corr) %>% 
+  melt() %>% 
+  distinct() %>% 
+  rename("Var1"="dmr_1", "Var2"="dmr_2", "value"="R") %>%
+  left_join(peak_plus_mC[,c("id_dmr", "start_dmr")], by = join_by("dmr_1"=="id_dmr")) %>%
+  rename("start_dmr"="start_1") %>%
+  left_join(peak_plus_mC[,c("id_dmr", "start_dmr")], by = join_by("dmr_2"=="id_dmr")) %>%
+  rename("start_dmr"="start_2")
+
+# visualize LD
+ggplot(peak_corr) +
+  geom_point(aes(as.numeric(start_1)/1e+6, as.numeric(start_2)/1e+6, color=R**2), shape=15 ) +
+  scale_color_gradient2(low = "white", high = "black") +
+  labs(color=expression(paste("R"^"2"))) +
+  scale_x_continuous(limits = c(3, 9)) +
+  scale_y_continuous(limits = c(3, 9)) +
+  coord_fixed(ratio = 1) +
+  theme_void() +
+  theme(
+        panel.border = element_rect(color = "black", fill=NA, size = 1)
+        ) 
+
+ggsave("figures/epi_LD_chr1.png", width = 5, height = 5, dpi = 600)
+
+# select the top dmr that has the strongest effect on the rest of the DMRs (R^2>0.5)
+# highest connectivity in a network sensperspective
+peak_net = peak_corr %>% mutate(r_sq = R**2) %>%
+  filter(r_sq > 0.5, R != 1)
+
+# Use Erdos Renyi formulate to calculate the number of connections expected by chance and use that as a threshold
+# N(N-1)p/2
+# p is the probability of observing a positive correlation (R^2>0.8) from the total number of comparisons
+N_net = (( nrow(peak_plus_mC) - 1 ) * nrow(peak_plus_mC) ) / 2
+p_conn = nrow(peak_net) /  ( N_net )
+
+peak_net_ann = peak_net %>%
+  group_by(dmr_1) %>%
+  mutate(connections = n()) %>%
+  distinct(dmr_1, start_1, connections) %>%
+  arrange(dplyr::desc(connections)) %>%
+  left_join(peak_plus_mC[, c("id_dmr", "context", "adj_p")], by = join_by("dmr_1" == "id_dmr")) %>%
+  ungroup() %>%
+  filter(connections >= 10)
+
+# the highest was 41 connections, so by chance we expect 5 connections
+peak_net = filter(peak_net, dmr_1 %in% peak_net_ann$dmr_1, dmr_2 %in% peak_net_ann$dmr_1)
+
+# build network
+peak_graph = graph_from_data_frame(peak_net, directed = F, vertices = peak_net_ann)
+
+# plot
+ggraph(peak_graph) +
+  geom_edge_diagonal(color="gray60", width = 0.2, alpha=0.8) +
+  geom_node_point(aes(fill=context, size=connections/adj_p), shape=21) +
+  labs(fill="Context", 
+       size=expression( paste("Support = ", frac("Centrality", "Adj P"), sep = "" ) )) +
+  scale_fill_manual(values = met.brewer("Egypt"),
+                    guide = guide_legend(override.aes = list(size = 5)
+                                          )) +
+  theme_void() +
+  theme(
+    text = element_text(size = 20), 
+    legend.position = "right"
+  )
+
+ggsave("figures/net_chr1.png", width = 10, height = 5, dpi = 600)
+
+# select the top and calculate distance
+# I selected all highly significant
+# make bed file and save it to find genes and intersections
+candidates = peak_net_ann %>% filter(adj_p < 0.01) %>% 
+  mutate(support = connections/adj_p) %>% 
+  arrange(dplyr::desc(support)) %>% 
+  dplyr::select(-c(context, start_1)) %>%
+  left_join(dmr_bed, by = join_by("dmr_1" == "id_dmr")) %>%
+  relocate(chr_dmr, start_dmr, end_dmr, context, .before = dmr_1)
+
+
+write.table(candidates, "raw/candidate_dmrs.bed", quote = F, sep = "\t", row.names = F, col.names = F)
+
+# calculate MAF of the candidates in the whole pop
+all_bin = read.table("data/all_matrix.tsv", header = T)
+
+# select the candidates and make a matrix
+bincandmat = filter(all_bin, id_dmr %in% candidates$dmr_1) %>% dplyr::select(-c(chr_dmr, context, start_dmr, end_dmr)) %>% column_to_rownames("id_dmr")
+
+bincandmat[bincandmat < 60] = 0
+bincandmat[bincandmat >= 60] = 1
+
+bincandmat = as.data.frame(rowSums(bincandmat) ) %>% rownames_to_column("dmr") %>% mutate(maf = (169 - rowSums(bincandmat))/169)
+
+min(bincandmat$maf)
+max(filter(bincandmat, maf<0.5)$maf)
+hist(bincandmat$maf)
+
+# check if they have tissue bias
+root_bias = read.table("data/root_leaf_differential_mC.tsv", header = T)
+
+filter(root_bias, id_dmr %in% candidates$dmr_1)
+bincandmat
+```
+
+
+```{r phenotype X candidate DMRs}
+# plot mC per candidate DMR
+# order epiRILs by phenotype
+# order DMRs by position
+
+ld_block = test %>% filter(id_dmr %in% candidates$dmr_1) %>%
+  group_by(sample) %>%
+  summarise(id_dmr,
+            mean_pheno = mean(phenotype),
+            mC) %>%
+  ungroup() %>%
+  distinct() %>%
+  left_join(dmr_bed, by="id_dmr") %>%
+  mutate(sample = fct_reorder(sample, mean_pheno),
+         id_dmr = fct_reorder(id_dmr, start_dmr))
+         
+
+pheno_block = ggplot(ld_block) +
+  geom_vline(xintercept = 0, color = "gray", linetype="dashed") +
+  geom_bar(aes(mean_pheno, sample), stat = "identity", fill="black", width = 0.5) +
+  labs(x="Legionellaceae abundance (vs. soil)", y=NULL) +
+  theme_bw() +
+  theme(text = element_text(size=20),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 15),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size=2)
+        ) 
+
+mc_block = ggplot(ld_block) +
+  geom_tile(aes(id_dmr, sample, fill=mC)) +
+  scale_fill_viridis_c(option = "magma", breaks=c(0,50,100)) +
+  labs(x=NULL, y=NULL, fill="Methylation (%)") +
+  theme_bw() +
+  theme(text = element_text(size=20),
+        legend.text = element_text(size = 15),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 15),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size=2)
+        ) 
+
+mc_block %>% insert_right(pheno_block, width = 0.2)
+
+ggsave("figures/LD_block_plus_pheno.png", width = 20, height = 8, dpi = 600)
+```
+
+
+```{r methylation and expression in roots}
+# data from https://www.nature.com/articles/nplants201658#Sec1
+# load data 
+intersects = read.table("data/intersects.tsv", header = F)
+colnames(intersects) = c("gene", "id_dmr")
+
+cand_mC = read.table("data/candidates_mC.tsv", header = F)
+colnames(cand_mC) = c("id_dmr", "chr", "site", "site_2", "strand", "context", "meth", "reads", "tissue")
+
+cand_fpkm = read.table("data/candidates_fpkm.tsv", header = F)
+colnames(cand_fpkm) = c("gene", "fpkm", "tissue")
+
+# rename Actin
+cand_fpkm$gene = gsub("AT3G18780", "Actin 2", cand_fpkm$gene)
+cand_mC$id_dmr = gsub("AT3G18780", "Actin 2", cand_mC$id_dmr)
+
+# select the least expressed
+cand_fpkm %>% group_by(gene) %>% summarise(exp=mean(log2(fpkm))) %>% arrange(exp) 
+
+# plot
+ggplot(cand_fpkm) +
+  geom_boxplot(aes(gene, log2(fpkm))) +
+  geom_point(aes(gene, log2(fpkm))) +
+  labs(x=NULL, 
+       y= expression("Expression (" * log[2] * "FPKM" * ")"  )  ) +
+  theme_bw() +
+  theme(text = element_text(size=20),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 15),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size=2)
+        ) 
+
+ggsave("figures/candidates_expression.png", width = 16, height = 8, dpi = 600)
+
+
+# calculate mean methylation per dmr
+cand_mC = cand_mC %>%
+  mutate(mC = meth/reads) %>% 
+  group_by(id_dmr, tissue) %>%
+  summarise(mean_mC = mean(mC)) %>%
+  ungroup()
+
+# give each intersection an ID so we can compare over multi-overlappers
+intersects = intersects %>% mutate(int_ID = paste(id_dmr, gene, sep = " - "))
+# add Actin
+intersects = rbind(intersects, 
+                    data.frame(gene = "Actin 2",
+                               id_dmr = "Actin 2", 
+                               int_ID = "Actin 2 (± 1kb)")
+)
+
+# merge data
+intersects = intersects %>% 
+  left_join(cand_mC, by="id_dmr") %>%
+  left_join(cand_fpkm, by = c("gene", "tissue"))
+
+# plot methylation at the DMR
+ggplot(intersects) +
+  geom_boxplot(aes(int_ID, mean_mC)) +
+  geom_point(aes(int_ID, mean_mC)) +
+  labs(x="Overlap", 
+       y= "Root methylation (all contexts)" ) +
+  theme_bw() +
+  theme(text = element_text(size=20),
+        axis.text.x = element_text(angle = 90, vjust = 1, hjust=1, size = 10),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size=2)
+        ) 
+
+ggsave("figures/candidates_methylation.png", width = 20, height = 10, dpi = 600)
+
+intersects_test = as.data.table(intersects)[, rbindlist(list( as.data.frame(t( as.data.frame(summary(glm(log2(fpkm+1) ~ mean_mC, data = .SD))$coefficients[2,]) )) )), by = int_ID]
+
+# Now compare only Auxin and the LRR candidate dmr_604_CG - AT1G10850
+
+mc_c = filter(intersects, int_ID %in% c("Actin 2 (± 1kb)", "dmr_604_CG - AT1G10850")) %>%
+  ggplot() +
+  geom_jitter(aes(mean_mC, int_ID), width = 0.2) +
+  geom_boxplot(aes(mean_mC, int_ID)) +
+  labs(y = NULL,
+       x = "Methylation (%)") +
+  theme_bw() +
+  theme(text = element_text(size=20),
+        axis.text.x = element_text(size = 10),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size=2)
+        ) 
+
+fpkm_c = filter(intersects, int_ID %in% c("Actin 2 (± 1kb)", "dmr_604_CG - AT1G10850")) %>%
+  ggplot() +
+  geom_jitter(aes(log2(fpkm), int_ID), width = 0.2) +
+  geom_boxplot(aes(log2(fpkm), int_ID)) +
+  labs(y = NULL,
+       x = expression("Expression (" * log[2] * "FPKM" * ")"  ) ) +
+  theme_bw() +
+  theme(text = element_text(size=20),
+        axis.text.x = element_text(size = 10),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size=2)
+        ) 
+
+mc_c %>% insert_right(fpkm_c)
+
+ggsave("figures/LRR_vs_Actin.png", width = 10, height = 3, dpi = 600)
+```
+
+
+```{r 604_CG vs phenotype}
+# visualize candidates
+filter(test, id_dmr == "dmr_604_CG") %>%
+  ggplot() +
+  geom_smooth(aes(mC, phenotype), method = "lm", color="black") +
+  geom_point(aes(mC, phenotype), size=3, color = met.brewer("Egypt", 1)) +
+  labs(x="dmr_604_CG Methylation (%)", y="Legionellaceae abundance (vs. soil)") +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 20),
+        axis.text.x = element_text(size=15),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size = 1),
+        panel.spacing = unit(0.5, "lines")) 
+
+ggsave("figures/candidate_lm.png", width = 8, height = 7, dpi = 600)
+
+filter(test, id_dmr == "dmr_604_CG") %>%
+  mutate(status = ifelse(mC<55, "Bin 0-55", ifelse(mC<85, "Bin 56-85", "Bin 86-100"))) %>%
+  group_by(status) %>%
+  mutate(m_s = mean(mC)) %>%
+  ungroup() %>%
+  mutate(status = fct_reorder(status, m_s)) %>%
+  ggplot() +
+  geom_boxplot(aes(status, phenotype), color = met.brewer("Egypt", 1), outlier.colour = "white", width = 0.4) +
+  geom_jitter(aes(status, phenotype), fill = met.brewer("Egypt", 1), width = 0.1, shape=21, size=4, color="black") +
+  labs(x="dmr_604_CG Methylation (%)", y="Legionellaceae abundance (vs. soil)") +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 20),
+        axis.text.x = element_text(size=20),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size = 1),
+        panel.spacing = unit(0.5, "lines")) 
+
+ggsave("figures/candidate.png", width = 8, height = 7, dpi = 600)
+```
+
+
+```{r genomic neighborhood DMR 604_CG}
+# https://www.ncbi.nlm.nih.gov/pmc/articles/PMC7795555/#B91-ijms-22-00313
+neighbors = read.table("data/LRR_neighborhood.bed")
+colnames(neighbors) = c("chr", "start", "end", "class", "name")
+
+ggplot(neighbors, aes(xmin = start/1e+6, xmax=end/1e+6, y=name, fill=name)) +
+  geom_gene_arrow(size=0.5) +
+  labs(x="Chromosome 1 position (Mb)", y=NULL, fill=NULL) +
+  scale_fill_manual(values = c("black", met.brewer("Egypt")[1], "gray")) +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 20),
+        axis.text.x = element_text(size=15),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size = 1),
+        panel.spacing = unit(0.5, "lines")) 
+
+ggsave("figures/LRR_neighborhood.png", width = 6, height = 3, dpi = 600)
+```
+
+
+```{r negative control GWAS}
+
+# select 4 random taxa
+random_pheno = sample(levels(as.factor(rhizo_pheno$pheno_name)), size = 4)
+# "OTU-B_3223"                "OTU-B_2279"                "Order_Oscillospirales"     "Family_Ilumatobacteraceae"
+
+control = rhizo_pheno %>% 
+  left_join(soil_mean[, -2], by = c("pheno_name", "pool")) %>% 
+  filter(pheno_name %in% random_pheno) %>%
+  mutate(phenotype = mean_soil - phenotype) %>% 
+  dplyr::select(-mean_soil) 
+
+# merge phenotypes and epygenotypes
+# right_join will keep only the samples with DMR info
+control = control %>% right_join(trans_matrix, by = "sample")
+
+control = melt(control, 
+             id.vars = c(meta_cols, "pool", "pheno_name", "phenotype"), 
+             measure.vars = dmr_columns,
+             value.name = "mC",
+             variable.name = "id_dmr")
+
+# make pheno x dmr groups
+control = control %>% mutate(group = paste(pheno_name, id_dmr, sep = "X"))
+
+# check we made the groups correctly
+length(levels(as.factor(control$group))) / length(dmr_columns) # alles gut!
+
+# GWAS
+control_EWAS = as.data.table(control)[, rbindlist(list(DMR_GWAS(.SD))), by = group]
+
+# correct p-vals
+adjusted_control_EWAS = data.frame(control_EWAS, adj_p = p.adjust(control_EWAS$test_p, method = "fdr"))
+
+# filter and extract dmr from group
+adjusted_control_EWAS = filter(adjusted_control_EWAS, residuals_norm_p > 0.05, het_test_p > 0.05) %>%
+ mutate(id_dmr = str_extract(group, "dmr_[:digit:]+_[:alpha:]+")) %>%
+  left_join(dmr_bed, by="id_dmr") %>%
+  filter(chr_dmr != "M")
+
+# data for "OTU-B_3223" got removed after validation
+
+# plot
+ggplot(adjusted_control_EWAS) +
+  geom_hline(yintercept = 0, color="black") +
+  geom_hline(yintercept = -log10(0.01), size=1, linetype = "dashed", color="gray60") +
+  geom_point(aes(y = -log10(adj_p), x = start_dmr, color=context), alpha=0.6, size=2) +
+  facet_grid(pheno_name ~ chr_dmr, scales = "free_x") +
+  scale_color_manual(values = met.brewer("Egypt"),
+                    guide = guide_legend(override.aes = list(size=6))) +
+  labs(x="Chromosome position", 
+       y=expression(-log[10]("Adj P"))) +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 20),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size = 1),
+        strip.text.y = element_text(size = 10),
+        panel.spacing = unit(0.5, "lines")) 
+
+ggsave("figures/control_GWAS.png", width = 18, height = 8, dpi = 600)
+
+# calculate number of strong associations per phenotype
+adjusted_control_EWAS %>% filter(adj_p < 0.01) %>% group_by(pheno_name) %>%
+  summarise(n = n())
+```
+
+
+
+
+## 3.3 .- Endospheric Bacteria
+
+
+The following analysis were also done using only forward reads, as they belong to the third run.
+
+
+```{r endo data processing and phyloseq object}
+endo_seq  = as.tibble(list.files("raw/16s/pool2", full.names = T)) %>% 
+                  dplyr::rename("path" = "value") %>% 
+                  tidyr::separate(path, c("ID", "type", "gene"), sep = c("_"), remove = F) %>% 
+                  mutate(read = str_extract(gene, "[1/2].fq"),
+                         read = gsub(".fq", "", read),
+                         gene = gsub(".[1/2].fq.gz", "", gene),
+                         ID = gsub("raw/16s/pool2/", "", ID)) %>%
+                  mutate(pool = 2,
+                         out_path = paste("clean/", type, "/", ID, "_", read, ".fastq", sep = "") )
+
+endo_seq = filter(endo_seq, type == "endo")
+
+# visualize quality
+plotQualityProfile(sample(filter(endo_seq, read == 1)$path, size = 12))
+ggsave("figures/endo_quality_forward.png", width = 10, height = 7, dpi = 600)
+
+plotQualityProfile(sample(filter(endo_seq, read == 2)$path, size = 12))
+ggsave("figures/endo_quality_reverse.png", width = 10, height = 7, dpi = 600)
+
+# trimming and filtering
+endo_filter_out = filterAndTrim(filter(endo_seq, read == 1)$path, # Path of the Forward reads
+                                filter(endo_seq, read == 1)$out_path, # Output path, Forward
+                                filter(endo_seq, read == 2)$path, # Reverse Reads, raw
+                                filter(endo_seq, read == 2)$out_path, # Output path, Reverse
+                                truncLen = c(220,210), # Truncation. First value is for forward, second is for reverse read
+                                trimLeft = 5,
+                                trimRight = 5,
+                                maxN=0, # Maximum N (uncalled bases) allowed. None. Do not change
+                                truncQ=2, # Quality trimming
+                                maxEE = c(2,4), # Error filter
+                                rm.phix=TRUE, # Remove phiX spike-ins
+                                compress=TRUE, 
+                                multithread=TRUE,
+                                n=5e6)
+
+# correction
+endo_err_for = learnErrors(filter(endo_seq, read == 1)$out_path, multithread=TRUE) 
+#endo_err_rev = learnErrors(filter(endo_seq, read == 2)$out_path, multithread=TRUE) 
+
+# dereplication, getting unique sequences
+endo_derep_for = derepFastq(filter(endo_seq, read==1)$out_path)
+#endo_derep_rev = derepFastq(filter(endo_seq, read==2)$out_path)
+
+# get the IDs back
+names(endo_derep_for) = filter(endo_seq, read==1)$ID
+#names(endo_derep_rev) = filter(endo_seq, read==2)$ID
+
+# ASV identification
+endo_dada_for = dada(endo_derep_for, err=endo_err_for, multithread=TRUE)
+#endo_dada_rev = dada(endo_derep_rev, err=endo_err_rev, multithread=TRUE)
+
+# merge and create full-lenght contigs 
+#endo_merged = mergePairs(endo_dada_for,
+#                         endo_derep_for,
+#                         endo_dada_rev,
+#                         endo_derep_rev,
+#                         minOverlap = 5,
+#                         maxMismatch = 1,
+#                         verbose = T)
+
+# only forward reads
+#endo_for = getUniques(endo_dada_for)
+
+# make a sequence table
+endo_seqtab = makeSequenceTable(endo_dada_for)
+dim(endo_seqtab)
+# 5880 ASVs
+
+# remove chimeras
+endo_clean_table = removeBimeraDenovo(endo_seqtab, multithread = 16, method="consensus")
+dim(endo_clean_table)
+# 5304 ASVs
+
+# assign taxonomy
+endo_taxa = assignTaxonomy(endo_clean_table, "ref/silva_nr99_v138.1_train_set.fa.gz", 
+                           multithread=16, 
+                           tryRC=TRUE,
+                           minBoot = 80)
+
+endo_taxa = addSpecies(endo_taxa, "ref/silva_species_assignment_v138.1.fa.gz", tryRC = TRUE)
+
+# rename
+endo_fa = getSequences(endo_clean_table)
+names(endo_fa) = paste("OTU-E", 1:length(endo_fa), sep = "_" )
+
+colnames(endo_clean_table) = paste("OTU-E", 1:length(endo_fa), sep = "_" )
+rownames(endo_taxa) = paste("OTU-E", 1:length(endo_fa), sep = "_" )
+
+# read metadata
+endo_exp = read_excel("data/epiRILs_data.xlsx", sheet = "data", na = "NA")
+
+endo_exp = endo_exp %>% 
+          mutate(sample = paste("eR", epiRIL, sep = ""), 
+                 position = paste("r", row, sep = "_"),
+                 block = paste("t", tray, sep = "_")) %>% 
+          relocate(sample, ID, position, block, .before = harv_date) %>%
+          dplyr::select(-c(epiRIL, replicate, survival, col, tray, flower, size, row, fresh_weight_mg)) %>% 
+          filter(ID %in% endo_seq$ID)
+
+# add names so it can be read by phyloseq
+rownames(endo_exp) = endo_exp$ID
+
+# merge all data into one object
+endo_phy = phyloseq(otu_table(endo_clean_table, taxa_are_rows =F),
+                    tax_table(endo_taxa))
+
+# reorder the metadata using the order from DADA2
+endo_exp = as.data.frame(endo_exp[match(sample_names(endo_phy), rownames(endo_exp)),] )
+rownames(endo_exp) = endo_exp$ID # add names again
+
+all(rownames(endo_clean_table) == sample_names(endo_phy)) # now they have the same order
+
+# now add metadata, sequences and tree
+endo_phy = phyloseq(otu_table(endo_clean_table, taxa_are_rows =F),
+                   sample_data(endo_exp),
+                   tax_table(endo_taxa),
+                   refseq(DNAStringSet(endo_fa)))
+
+# clean low-abundance OTUS
+endo_phy = prune_taxa(c(taxa_sums(endo_phy) > 100), endo_phy) # we get 2938 OTUS left
+# 1252 left
+
+# Clean unwanted OTUS
+# Calculate the percentage of organellar counts
+( sum(subset_taxa(endo_phy, Family == 'Mitochondria')@otu_table, na.rm = T) + sum(subset_taxa(endo_phy, Order == 'Chloroplast')@otu_table, na.rm = T) )*100 / sum(endo_phy@otu_table, na.rm = T)
+# 16%, still good after using the PNAs!
+
+# If I use logical arguments, cleaning by taxa will also remove unnasigned OTUS, which is not wanted now
+# I will extract directly the unwanted OTUS and then remove them
+unwanted = c(
+rownames(subset_taxa(endo_phy, Family == 'Mitochondria')@tax_table), # mito
+rownames(subset_taxa(endo_phy, Order == 'Chloroplast')@tax_table), # chloro
+rownames(subset(as.data.frame(endo_phy@tax_table), is.na(Phylum))) # no phyla
+)
+endo_phy = prune_taxa(taxa_names(endo_phy)[!taxa_names(endo_phy) %in% unwanted], endo_phy) # 1225 OTUS left
+
+# for plotting purposes, I will add a new column to the taxa table to get only the top 10 Phylum (based on the number of OTUs)
+top_phyla = as.data.frame(table(as.data.frame(endo_phy@tax_table)$Phylum) ) %>%
+                          dplyr::rename("Phylum" = "Var1") %>%
+                          arrange(dplyr::desc(Freq)) %>% 
+                          mutate(Phylum = as.character(Phylum),
+                                 plot_Phylum = ifelse(row_number() < 15, Phylum, "Other"))
+
+# add data while keeping the rownames (OTU names)
+endo_phy = merge_phyloseq(endo_phy, tax_table(as.data.frame(endo_phy@tax_table) %>% rownames_to_column('OTU') %>% 
+  left_join(top_phyla[,c(1,3)], by="Phylum") %>% column_to_rownames('OTU') %>% as.matrix())) 
+
+rm(top_phyla, unwanted)
+
+# save fasta and make tree
+writeXStringSet(DNAStringSet(endo_phy@refseq), "raw/endo.fa")
+
+# read tree and merge it into the dataset
+endo_tree = read.tree("raw/endo_contree.nw") # update bootstrap
+endo_phy = merge_phyloseq(endo_phy, endo_tree)
+  
+# save raw data
+saveRDS(endo_phy, "endo_phyloseq.rds")
+```
+
+
+```{r endo track reads}
+# get counts for each step
+endo_reads = as.data.frame(cbind(filter(endo_seq, read == 1)$ID, 
+                                 endo_filter_out, 
+                                 sapply(endo_dada_for, getN), 
+                                 rowSums(endo_clean_table)))
+
+colnames(endo_reads) = c("ID", "input", "filtered", "denoisedF", "final")
+
+# for some reason all columns are identified as character entries
+order = endo_reads[order(as.numeric(endo_reads$input), decreasing = TRUE),]$ID
+
+# add difference
+endo_reads = endo_reads %>% 
+  mutate("filtered out" = as.numeric(input) - as.numeric(final)) %>% 
+  melt(id.vars = "ID", measure.vars = c("filtered out", "final")) 
+
+# order based on the initial number of reads
+endo_reads$ID = factor(endo_reads$ID, levels = order)
+rm(order)
+
+# plot
+ggplot(endo_reads) +
+  geom_bar(aes(x=as.numeric(value), y=ID, fill=variable), stat = "identity") +
+  scale_fill_manual(values = c("gray", "gray4")) +
+  labs(x="Read counts", y= NULL, fill=NULL) +
+  theme_bw() +
+  theme(legend.position = "top",
+        text = element_text(size = 25),
+        axis.ticks.y = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x.bottom = element_line(color = 'black')
+        ) 
+  
+ggsave("figures/endo_reads.png", width = 10, height = 10, dpi = 600)
+```
+
+
+```{r endo diversity}
+endo_phy = read_rds("endo_phyloseq.rds")
+
+# calculate relative contribution of each Phylum (%) to the dataset
+psmelt(endo_phy) %>% 
+            ungroup() %>%
+            rownames_to_column("counts") %>% 
+            group_by(ID) %>% 
+            mutate(counts = as.integer(counts),
+                   tss = counts*100/sum(counts)) %>%
+            ungroup() %>% 
+            group_by(ID, plot_Phylum) %>%
+            mutate(phylum_tss = sum(tss)) %>% 
+            ungroup() %>% 
+            dplyr::select(sample, ID, plot_Phylum, phylum_tss) %>% 
+            distinct() %>%
+  filter(sample != "BS") %>%
+  ggplot() +
+  geom_bar(aes(ID, phylum_tss, fill=plot_Phylum), stat="identity") +
+  scale_fill_manual(values = c(scales::viridis_pal()(14)[1:11], "gray", scales::viridis_pal()(14)[12:14]))
+
+# calculate alpha diversity, 
+endo_diversity = alpha_beta_div(endo_phy)
+
+endo_diversity = melt(endo_diversity,
+                   id.vars = meta_cols,
+                   variable.name = "pheno_name",
+                   value.name = "phenotype")
+
+# compute the fixed effect of each factor
+as.data.table(endo_diversity)[, rbindlist(list(diversity_factor_lm(.SD))), by = pheno_name] %>%
+  mutate(p_val = p_val + 0.0001) %>%
+  ggplot() +
+  geom_tile(aes(factor, pheno_name, fill=-log10(p_val))) +
+  scale_fill_viridis_c(na.value = "white", option="mako") +
+  labs(x=NULL, y=NULL, fill=expression(-log[10](P)))+
+  theme_bw() +
+  theme(axis.text = element_text(size=20)
+    ) 
+ggsave("figures/endo_fixed_factors.png", width = 12, height = 8, dpi = 600)
+
+
+# calculate heritability and make associations
+endo_comm_H = as.data.table(endo_diversity)[, rbindlist(list(epi_H(.SD, formula))), by = pheno_name]
+post_H(endo_comm_H, 0.0001, c("red4", "black"))
+# very low heritability
+
+# now the association
+endo_comm_AS = as.data.table(endo_diversity)[, rbindlist(list(epi_AS(.SD, formula_AS))), by = pheno_name]
+post_AS(endo_comm_AS, 0.001, c("red4", "black"), T)
+
+# As there was no significant association, we will only save the results from heritability
+post_H(endo_comm_H, 0.0001, c("red4", "black"))
+ggsave("figures/endo_comm_H.png", width =12, height = 6, dpi = 600)
+
+
+# Since the only Heritable component of the community is the normalized Shannon, plot that one
+
+as.data.frame(ordinate(transform_sample_counts(endo_phy, function(x) x / sum(x) ), distance = "wunifraq")[["rproj"]]) %>% 
+  rownames_to_column("ID") %>% 
+  left_join(endo_phy@sam_data, by="ID") %>% 
+  group_by(sample) %>%
+  mutate(min_beta = min(DCA2),
+         max_beta = max(DCA2)) %>%
+  ungroup() %>%
+  ggplot() +
+  geom_segment(aes(x=sample, xend = sample, y=min_beta, yend=max_beta, color=sample),size=2) +
+  geom_point(aes(sample, DCA2, fill=sample), shape=21, size=6) +
+  scale_fill_manual(values = met.brewer("Cross", 9)) +
+  scale_color_manual(values = met.brewer("Cross", 9)) +
+  labs(x="Epigenotype", y= "TSS W-UniFrac DCA2", fill = "Epigenotype") +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 20),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 15),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size = 2)
+        ) 
+
+ggsave("figures/endo_beta.png", width = 5, height = 6, dpi = 600)
+
+```
+
+
+```{r endo heritability OTUs }
+
+# 588 non-redundant OTUs, 218 genera, 172 families, 121 orders, 1099 phenotypes to test
+endo_tip = tip_glom(endo_phy, h=0.1)
+
+# Glom at the Genus level
+endo_genus = tax_glom(endo_phy,
+                       taxrank = "Genus",
+                       NArm =TRUE
+                       )
+# rename table
+colnames(endo_genus@otu_table) = paste("Genus", gsub(" ", "_", as.data.frame(endo_genus@tax_table)$Genus), sep = "_")
+
+# Glom at the family level
+endo_fam = tax_glom(endo_phy,
+                     taxrank = "Family",
+                     NArm =TRUE
+                     )
+# rename table
+colnames(endo_fam@otu_table) = paste("Family", gsub(" ", "_", as.data.frame(endo_fam@tax_table)$Family), sep = "_")
+
+# Glom at the Order level
+endo_order = tax_glom(endo_phy,
+                       taxrank = "Order",
+                       NArm =TRUE
+                       )
+# rename table
+colnames(endo_order@otu_table) = paste("Order", gsub(" ", "_", as.data.frame(endo_order@tax_table)$Order), sep = "_")
+
+
+# Transform counts, merge and add metadata
+endo_pheno = VSTPhy(endo_tip) %>% 
+                    left_join(VSTPhy(endo_genus), by="ID") %>%
+                    left_join(VSTPhy(endo_fam), by="ID") %>%
+                    left_join(VSTPhy(endo_order), by="ID")
+
+rm(endo_tip, endo_genus, endo_fam, endo_order)
+endo_pheno = endo_pheno %>% left_join(as.data.frame(endo_phy@sam_data), by="ID") %>% relocate(meta_cols, .before = ID)
+
+# melt data
+endo_pheno = melt(endo_pheno,
+                   id.vars = meta_cols,
+                   variable.name = "pheno_name",
+                   value.name = "phenotype")
+
+# rename the Rhizobium taxa as it is very long
+endo_pheno$pheno_name = gsub("Allorhizobium-Neorhizobium-Pararhizobium-", "", endo_pheno$pheno_name)
+
+length(levels(as.factor(endo_pheno$pheno_name))) # check all phenotypes are there
+
+# calculate heritability
+formula = "~ (1|sample) + (1|block) + (1|position) + (1|harv_date) + (1|harv_pers)"
+endo_H = as.data.table(endo_pheno)[, rbindlist(list(epi_H(.SD, formula))), by = pheno_name]
+
+# correct p.values
+endo_H$ratio_test_p = p.adjust(endo_H$ratio_test_p, method = "fdr")
+
+# select the top heritable taxa for the plot, only 17 with the stringent filter
+filter(endo_H, residuals_norm_p > 0.05, het_test_p > 0.05, ratio_test_p < 0.05) %>% arrange(dplyr::desc(heritability))
+# no one was significant
+
+# I will only use black as I already selected valid models
+post_H(filter(endo_H, pheno_name %in% top_endo$pheno_name), 0.05, c("black"))
+
+# compute the associations
+formula_AS = "~ sample + (1|block) + (1|position) + (1|harv_date) + (1|harv_pers)"
+endo_AS = as.data.table(endo_pheno)[, rbindlist(list(epi_AS(.SD, formula_AS))), by = pheno_name]
+
+# correct p.values
+endo_AS$test_p = p.adjust(endo_AS$test_p, method = "fdr")
+
+# Only four go after the threshlod
+filter(endo_AS, residuals_norm_p > 0.05, het_test_p > 0.05, test_p < 0.05)
+
+# Only OTU-E_905 was significant
+# merge plots fro the only associated OTU
+
+post_H(filter(endo_H, pheno_name == "OTU-E_905"), 0.05, c("red4")) %>% 
+  insert_right(post_AS(filter(endo_AS, pheno_name == "OTU-E_905"), 0.05, c("black"), F), width = 0.6)
+
+
+ggsave("figures/endo_top.png", width = 18, height = 2, dpi = 600)
+```
+
+
+# 4 .- Plot all
+
+```{r figure 1}
+# load objects
+its_phy = read_rds("its_phyloseq.rds")
+endo_phy = read_rds("endo_phyloseq.rds")
+rhizo_phy = read_rds("rhizo_phyloseq.rds")
+# load plant data
+exp = read_excel("data/epiRILs_data.xlsx", sheet = "data", na = "NA")
+list_biome = data.frame(sample = paste("eR", read.table("data/list_epiRILs_microbiome.txt", header = F)$V1, sep = "")) %>% mutate(biome = "yes")
+exp = exp %>% 
+      mutate(sample = paste("eR", epiRIL, sep = ""), 
+             position = paste("r", row, sep = "_"),
+             block = paste("t", tray, sep = "_")) %>% 
+      relocate(sample, ID, position, block, .before = epiRIL) %>%
+      dplyr::select(-c(replicate, epiRIL, survival, col, tray, flower, size, row)) %>% 
+      filter(sample %in% list_biome$sample)
+
+# transform data
+tss_rhizo = psmelt(rhizo_phy) %>% 
+            rownames_to_column("counts") %>% 
+            group_by(ID) %>% 
+            mutate(counts = as.integer(counts),
+                   tss = counts*100/sum(counts)) %>%
+            ungroup() %>% 
+            group_by(ID, plot_Phylum) %>%
+            mutate(phylum_tss = sum(tss)) %>% 
+            ungroup() %>%
+            group_by(sample, plot_Phylum) %>%
+            mutate(mean_tss = mean(phylum_tss)) %>%
+            ungroup() %>%
+            dplyr::select(sample, plot_Phylum, mean_tss) %>% 
+            distinct() %>%
+            filter(sample != "BS") %>%
+            mutate(compartment = "Rhizosphere", 
+                   type = "Bacteria")
+
+tss_endo = psmelt(endo_phy) %>% 
+            rownames_to_column("counts") %>% 
+            group_by(ID) %>% 
+            mutate(counts = as.integer(counts),
+                   tss = counts*100/sum(counts)) %>%
+            ungroup() %>% 
+            group_by(ID, plot_Phylum) %>%
+            mutate(phylum_tss = sum(tss)) %>% 
+            ungroup() %>%
+            group_by(sample, plot_Phylum) %>%
+            mutate(mean_tss = mean(phylum_tss)) %>%
+            ungroup() %>%
+            dplyr::select(sample, plot_Phylum, mean_tss) %>% 
+            distinct() %>%
+            filter(sample != "BS") %>%
+            mutate(compartment = "Endosphere", 
+                   type = "Bacteria")
+
+# merge bacteria
+tss_bacteria = rbind(tss_endo, tss_rhizo)
+
+# make palette and factors
+#colors_bacteria = c(sample(scales::viridis_pal()(14)[1:14], 14), "gray")
+levels_bacteria = c(levels(as.factor(tss_bacteria$plot_Phylum))[levels(as.factor(tss_bacteria$plot_Phylum)) != "Other"], "Other")
+
+# apply factors
+tss_bacteria$plot_Phylum = factor(tss_bacteria$plot_Phylum, levels = levels_bacteria)
+
+# transform fungi
+tss_its = psmelt(its_phy) %>% 
+            rownames_to_column("counts") %>% 
+            group_by(ID) %>% 
+            mutate(counts = as.integer(counts),
+                   tss = counts*100/sum(counts)) %>%
+            ungroup() %>% 
+            group_by(ID, Phylum) %>%
+            mutate(phylum_tss = sum(tss)) %>% 
+            ungroup() %>%
+            group_by(sample, Phylum) %>%
+            mutate(mean_tss = mean(phylum_tss)) %>%
+            ungroup() %>%
+            dplyr::select(sample, Phylum, mean_tss) %>% 
+            distinct() %>%
+            mutate(Phylum = replace_na(Phylum, "Unknown"),
+                   Phylum = gsub("p__", "", Phylum),
+                   compartment = "Rhizosphere", 
+                   type = "Fungi")
+
+# make palette and factors
+#colors_fungi = c(sample(scales::viridis_pal(option = "plasma")(6), 3), "gray")
+levels_fungi = c(levels(as.factor(tss_its$Phylum))[levels(as.factor(tss_its$Phylum)) != "Unknown"], "Unknown")
+
+# apply factors
+tss_its$Phylum = factor(tss_its$Phylum, levels = levels_fungi)
+
+# make plots
+plot_bacteria =  ggplot(tss_bacteria) +
+  geom_bar(aes(sample, mean_tss, fill=plot_Phylum), stat="identity") +
+  facet_wrap(type~compartment, ncol = 1, strip.position = "right") +
+  labs(x="Epigenotype", y="Relative Phylum abundance (%)", fill=NULL) +
+  scale_fill_manual(values = colors_bacteria) +
+  scale_y_continuous(breaks = c(1, 50, 100)) +
+  theme_bw() +
+  theme(text = element_text(size=36),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 20),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x.bottom = element_line(color = 'black'),
+        axis.line.y = element_line(colour = "black"),
+        strip.text.y.left = element_text(angle=0),
+        strip.placement = "outside")
+
+
+plot_fungi = ggplot(tss_its) +
+  geom_bar(aes(sample, mean_tss, fill=Phylum), stat="identity") +
+  facet_wrap(type~~compartment, ncol = 1, strip.position = "right") +
+  labs(x=NULL, y=NULL, fill=NULL) +
+  scale_fill_manual(values = colors_fungi) +
+  scale_y_continuous(breaks = c(1, 50, 100)) +
+  theme_bw() +
+  theme(text = element_text(size=36),
+        axis.ticks = element_blank(),
+        axis.text.x = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line.x.bottom = element_line(color = 'black'),
+        axis.line.y = element_line(colour = "black"),
+        strip.text.y.left = element_text(angle=0),
+        strip.placement = "outside")
+
+plot_w = exp %>% 
+  group_by(sample) %>%
+  mutate(min_w = min(fresh_weight_mg)/1000,
+         max_w = max(fresh_weight_mg)/1000,
+         mean_w = mean(fresh_weight_mg)/1000) %>%
+  ungroup() %>%
+  mutate(sample = fct_reorder(sample, mean_w)) %>%
+  ggplot() +
+  geom_segment(aes(x=sample, xend = sample, y=min_w, yend=max_w, color=sample),size=2) +
+  geom_point(aes(sample, fresh_weight_mg/1000, fill=sample), shape=21, size=6) +
+  scale_fill_manual(values = met.brewer("Cross", 47)) +
+  scale_color_manual(values = met.brewer("Cross", 47)) +
+  scale_y_continuous(breaks = c(0.5, 1.5, 2.5)) +
+  labs(x=NULL, y= "Rosette fresh weight (g)", fill = NULL) +
+  theme_bw() +
+  theme(legend.position = "none",
+        text = element_text(size = 36),
+        axis.ticks = element_blank(),
+        axis.text.x = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_rect(color = "black", fill=NA, size = 1)
+        ) 
+
+# merge plots
+plot_w %>% insert_bottom(plot_fungi) %>% insert_bottom(plot_bacteria, height = 2) 
+
+
+ggsave("figures/figure_1.png", width = 25, height = 22, dpi = 600)
+```
+
+
+```{r}
+sessionInfo()
+```
+
+
+
